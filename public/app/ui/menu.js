@@ -34,14 +34,6 @@ function fuzzyMatch(query, hay) {
 }
 
 export function getCommandMenuEntries(commands, options = {}) {
-    const review = Array.isArray(commands)
-        ? commands.find(
-              (cmd) =>
-                  cmd &&
-                  typeof cmd === "object" &&
-                  String(cmd.name || "").toLowerCase() === "review",
-          ) || null
-        : null;
     const messages = Array.isArray(options?.messages) ? options.messages : [];
     const hasSession = Boolean(options?.hasSession);
     const isStreaming = Boolean(options?.isStreaming);
@@ -50,14 +42,7 @@ export function getCommandMenuEntries(commands, options = {}) {
         (message) =>
             message && typeof message === "object" && message.role === "user",
     );
-    return [
-        {
-            key: "agents",
-            title: "agents",
-            description: "Open the agent launcher",
-            kind: "agents",
-            disabled: !hasSession,
-        },
+    const entries = [
         {
             key: "tree",
             title: "tree",
@@ -74,16 +59,31 @@ export function getCommandMenuEntries(commands, options = {}) {
             kind: "fork",
             disabled: !hasSession || !hasUserMessages || isStreaming,
         },
-        {
-            key: "review",
-            title: "review",
-            description:
-                review?.description || "Start an interactive code review",
-            kind: "review",
-            command: review,
-            disabled: !review,
-        },
     ];
+    const seen = new Set(entries.map((entry) => entry.key));
+    for (const command of Array.isArray(commands) ? commands : []) {
+        const rawName = String(command?.name || "").trim().replace(/^\/+/, "");
+        if (!rawName) continue;
+        const key = rawName.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        entries.push({
+            key,
+            title: rawName,
+            description: String(command?.description || command?.source || "Command"),
+            kind: "command",
+            command: {
+                ...command,
+                name: rawName,
+                executeImmediately:
+                    command?.source === "prompt" || command?.source === "skill"
+                        ? Boolean(command?.executeImmediately)
+                        : command?.executeImmediately !== false,
+            },
+            disabled: !hasSession || isStreaming,
+        });
+    }
+    return entries;
 }
 
 export async function handleCommandMenuAction({
@@ -95,12 +95,6 @@ export async function handleCommandMenuAction({
 }) {
     if (!entry || entry.disabled) return { ok: false, reason: "disabled" };
 
-    if (entry.kind === "agents") {
-        return { ok: true, action: "agents" };
-    }
-    if (entry.kind === "review") {
-        return { ok: true, action: "review" };
-    }
     if (entry.kind === "tree") {
         return { ok: true, action: "tree" };
     }
@@ -160,8 +154,6 @@ export function createMenu({
     onSetFollowUpMode,
     onInsertCommand,
     onExecuteCommand,
-    onRunAgent,
-    onRunReview,
     onRunTree,
     onRunFork,
 }) {
@@ -522,20 +514,6 @@ export function createMenu({
                         });
                         if (result.ok) {
                             close();
-                            if (result.action === "agents") {
-                                setTimeout(() => {
-                                    if (typeof onRunAgent === "function")
-                                        onRunAgent();
-                                }, 0);
-                                return;
-                            }
-                            if (result.action === "review") {
-                                setTimeout(() => {
-                                    if (typeof onRunReview === "function")
-                                        onRunReview();
-                                }, 0);
-                                return;
-                            }
                             if (result.action === "tree") {
                                 setTimeout(() => {
                                     if (typeof onRunTree === "function")
@@ -765,12 +743,12 @@ export function createMenu({
                     value:
                         prefs.voiceTranscriptionMode === "web-speech"
                             ? "web-speech (fast)"
-                            : "parakeet (accurate)",
+                            : "chatgpt (accurate)",
                     description: webSpeechSupported
                         ? prefs.voiceTranscriptionMode === "web-speech"
                             ? "Browser-native speech recognition. Faster but less accurate, esp. for code."
-                            : "Local ONNX model. More accurate but slower. Requires server setup."
-                        : "Parakeet (local ONNX) - more accurate. Web Speech API not available in this browser.",
+                            : "ChatGPT transcription via Codex OAuth. Highly accurate, fast, and handles code perfectly."
+                        : "ChatGPT (via Codex OAuth) - highly accurate. Web Speech API not available in this browser.",
                     active:
                         prefs.voiceTranscriptionMode === "web-speech" &&
                         webSpeechSupported,

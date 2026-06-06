@@ -1,20 +1,17 @@
 import { existsSync, readFileSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
-import { homedir } from "node:os";
 import { execFile, spawn } from "node:child_process";
 import { randomUUID, X509Certificate } from "node:crypto";
 import { PiWebRuntime, type SessionClient } from "./session-runtime.ts";
 import { FaceIdService } from "./faceid.ts";
 import { PushService } from "./push.ts";
-import { getGlobalNpmRoot } from "./system-pi.ts";
+import { getSystemPiEntryPath } from "./system-pi.ts";
 import { transcribeAudio, getVoiceStatus } from "./voice.ts";
-import { getVoiceNativeStatus, loadModels as loadVoiceModels } from "./voice-native.ts";
 
-// Resolve pi-subagents from npm global root (avoid hardcoding /usr/lib/...)
-const _npmGlobalRoot = getGlobalNpmRoot();
-if (!_npmGlobalRoot) throw new Error("Unable to resolve npm global root required for pi-subagents");
-const { discoverAgentsAll } = await import(join(_npmGlobalRoot, "pi-subagents", "agents.ts"));
+const _systemPiEntryPath = getSystemPiEntryPath();
+const _packageRoot = dirname(_systemPiEntryPath);
+const { discoverAgents } = await import(join(_packageRoot, "task", "discovery.ts"));
 import type {
 	ApiCommandRequest,
 	ApiActiveSessionsResponse,
@@ -25,8 +22,6 @@ import type {
 	ApiListModelsResponse,
 	ApiListReposResponse,
 	ApiListSessionsResponse,
-	ApiReviewConfigRequest,
-	ApiReviewConfigResponse,
 	ApiNavigateTreeRequest,
 	ApiOkResponse,
 	ApiReleaseRequest,
@@ -355,34 +350,6 @@ function requireJsonBody(req: Request): Promise<Record<string, unknown>> {
 	return req.json().catch(() => ({}));
 }
 
-const REVIEW_CONFIG_FILE = join(homedir(), ".pi", "agent", "review-settings.json");
-
-function normalizeReviewModelValue(value: unknown): string | null {
-	const trimmed = typeof value === "string" ? value.trim() : "";
-	return trimmed || null;
-}
-
-function isValidReviewModelValue(value: string): boolean {
-	const slashIndex = value.indexOf("/");
-	return slashIndex > 0 && slashIndex < value.length - 1;
-}
-
-async function readReviewConfig(): Promise<ApiReviewConfigResponse> {
-	try {
-		const raw = await readFile(REVIEW_CONFIG_FILE, "utf8");
-		const parsed = JSON.parse(raw);
-		return { defaultModel: normalizeReviewModelValue(parsed?.defaultModel) };
-	} catch {
-		return { defaultModel: null };
-	}
-}
-
-async function writeReviewConfig(defaultModel: string | null): Promise<ApiReviewConfigResponse> {
-	await mkdir(dirname(REVIEW_CONFIG_FILE), { recursive: true });
-	await writeFile(REVIEW_CONFIG_FILE, `${JSON.stringify({ defaultModel }, null, 2)}\n`, "utf8");
-	return { defaultModel };
-}
-
 const DIRECTORY_SEARCH_LIMIT = 20;
 const DIRECTORY_SEARCH_CACHE_TTL_MS = 60_000;
 const DIRECTORY_SEARCH_ROOTS = ["/root", "/home"];
@@ -505,13 +472,26 @@ function buildDirectoryIndex(): Promise<string[]> {
 	const roots = DIRECTORY_SEARCH_ROOTS.filter((root) => existsSync(root));
 	if (roots.length === 0) return Promise.resolve([]);
 
-	const rootsArg = roots.map((root) => JSON.stringify(root)).join(" ");
-	const cmd = `find ${rootsArg} \\
-		\\( -name .git -o -name node_modules -o -name dist -o -name build -o -name coverage -o -name .next -o -name .turbo -o -name target -o -name .cache \\) -prune \\
-		-o -type d -print 2>/dev/null`;
+	const pruneNames = [".git", "node_modules", "dist", "build", "coverage", ".next", ".turbo", "target", ".cache"];
+	const pruneExpression = pruneNames.flatMap((name, index) => [
+		...(index > 0 ? ["-o"] : []),
+		"-name",
+		name,
+	]);
+	const args = [
+		...roots,
+		"(",
+		...pruneExpression,
+		")",
+		"-prune",
+		"-o",
+		"-type",
+		"d",
+		"-print",
+	];
 
 	return new Promise((resolve, reject) => {
-		execFile("bash", ["-lc", cmd], { timeout: 15_000, maxBuffer: 8 * 1024 * 1024 }, (error, stdout) => {
+		execFile("find", args, { timeout: 15_000, maxBuffer: 8 * 1024 * 1024 }, (error, stdout) => {
 			if (error && (error as NodeJS.ErrnoException).killed) return reject(new Error("Search timed out"));
 			resolve(uniqueDirs(parseSearchLines(stdout || "")));
 		});
@@ -716,8 +696,19 @@ Bun.serve({
 				try { ws.close(1008, "invalid_socket"); } catch {}
 				return;
 			}
+			const isScratchTerminal = data.sessionId === "scratch";
 			try {
-				const init = runtime.addTerminalClient(data.sessionId, {
+				const init = isScratchTerminal ? runtime.addGlobalTerminalClient({
+					connectionId: data.connectionId,
+					clientId: data.clientId,
+					connectedAtMs: Date.now(),
+					send(event) {
+						try { ws.send(encodeTerminalEvent(event)); } catch {}
+					},
+					close(code, reason) {
+						try { ws.close(code, reason); } catch {}
+					},
+				}) : runtime.addTerminalClient(data.sessionId, {
 					connectionId: data.connectionId,
 					clientId: data.clientId,
 					connectedAtMs: Date.now(),
@@ -747,7 +738,11 @@ Bun.serve({
 				return;
 			}
 			try {
-				runtime.handleTerminalClientMessage(data.sessionId, data.connectionId, parsed);
+				if (data.sessionId === "scratch") {
+					runtime.handleGlobalTerminalClientMessage(data.connectionId, parsed);
+				} else {
+					runtime.handleTerminalClientMessage(data.sessionId, data.connectionId, parsed);
+				}
 			} catch (error) {
 				try {
 					ws.send(encodeTerminalEvent({
@@ -761,7 +756,11 @@ Bun.serve({
 		close(ws) {
 			const data = ws.data as TerminalWebSocketData | undefined;
 			if (!data || data.kind !== "terminal") return;
-			runtime.removeTerminalClient(data.sessionId, data.connectionId);
+			if (data.sessionId === "scratch") {
+				runtime.removeGlobalTerminalClient(data.connectionId);
+			} else {
+				runtime.removeTerminalClient(data.sessionId, data.connectionId);
+			}
 		},
 		binaryType: "uint8array",
 		maxPayloadLength: 2 * 1024 * 1024,
@@ -815,26 +814,6 @@ Bun.serve({
 			return json(body, 200);
 		}
 
-		if (req.method === "GET" && url.pathname === "/api/review/config") {
-			return json(await readReviewConfig(), 200);
-		}
-
-		if (req.method === "POST" && url.pathname === "/api/review/config") {
-			const raw = (await requireJsonBody(req)) as ApiReviewConfigRequest;
-			const defaultModel = normalizeReviewModelValue(raw?.defaultModel);
-			if (defaultModel !== null) {
-				if (!isValidReviewModelValue(defaultModel)) {
-					return errorResponse("Model must be in provider/id format", 400);
-				}
-				const models = await runtime.listModels();
-				const found = models.some((model) => `${model.provider}/${model.id}` === defaultModel);
-				if (!found) {
-					return errorResponse(`Model not found: ${defaultModel}`, 400);
-				}
-			}
-			return json(await writeReviewConfig(defaultModel), 200);
-		}
-
 		if (req.method === "GET" && url.pathname === "/api/active-sessions") {
 			const sessions = runtime.listActiveSessions();
 			const body: ApiActiveSessionsResponse = { sessions };
@@ -844,11 +823,16 @@ Bun.serve({
 		if (req.method === "GET" && url.pathname === "/api/agents") {
 			try {
 				const cwd = url.searchParams.get("cwd") || process.cwd();
-				const data = discoverAgentsAll(cwd);
-				const agents = [...(data.user || []), ...(data.project || []), ...(data.builtin || [])]
-					.map((a: any) => ({ name: a.name, description: a.description || "", scope: a.source || "builtin", model: a.model || null }));
+				const { agents: discovered } = await discoverAgents(cwd);
+				const agents = discovered.map((a: any) => ({
+					name: a.name,
+					description: a.description || "",
+					scope: a.source || "builtin",
+					model: Array.isArray(a.model) ? a.model[0] || null : (a.model || null),
+				}));
 				return json({ agents }, 200);
-			} catch {
+			} catch (err) {
+				console.error("Failed to discover agents:", err);
 				return json({ agents: [] }, 200);
 			}
 		}
@@ -984,13 +968,8 @@ Bun.serve({
 		}
 
 		if (req.method === "POST" && url.pathname === "/api/voice/warm") {
-			// Pre-load models to make first transcription fast
 			try {
-				if (getVoiceNativeStatus().available) {
-					void loadVoiceModels();
-					return json({ ok: true, warming: true }, 200);
-				}
-				return json({ ok: true, warming: false, reason: "native not available" }, 200);
+				return json({ ok: true, warming: false, reason: "using chatgpt-oauth" }, 200);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				return errorResponse(message, 500);
@@ -1162,6 +1141,16 @@ Bun.serve({
 			}
 		}
 
+
+		if (req.method === "POST" && action === "archive") {
+			const raw = (await requireJsonBody(req)) as Record<string, unknown>;
+			if (typeof raw?.archived !== "boolean") {
+				return errorResponse("Invalid archive payload", 400);
+			}
+			const archived = raw.archived;
+			await runtime.archiveSession(sessionId, archived);
+			return json({ archived }, 200);
+		}
 		if (req.method === "GET" && action === "tree") {
 			try {
 				return json(runtime.getSessionTree(sessionId), 200);
@@ -1226,10 +1215,12 @@ Bun.serve({
 
 		if (req.method === "GET" && action === "terminal") {
 			const clientId = url.searchParams.get("clientId")?.trim() || randomUUID();
-			try {
-				runtime.getSessionRole(sessionId, clientId);
-			} catch {
-				return errorResponse("Session not running", 404);
+			if (sessionId !== "scratch") {
+				try {
+					runtime.getSessionRole(sessionId, clientId);
+				} catch {
+					return errorResponse("Session not running", 404);
+				}
 			}
 			const upgraded = server.upgrade(req, {
 				data: {

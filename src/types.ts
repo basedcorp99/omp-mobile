@@ -20,14 +20,6 @@ export interface ApiListReposResponse {
 	repos: string[];
 }
 
-export interface ApiReviewConfigResponse {
-	defaultModel: string | null;
-}
-
-export interface ApiReviewConfigRequest {
-	defaultModel: string | null;
-}
-
 export interface ApiImageContent {
 	type: "image";
 	data: string;
@@ -65,6 +57,7 @@ export interface ApiSessionSummary {
 	messageCount: number;
 	isRunning: boolean;
 	isStreaming?: boolean;
+	archived?: boolean;
 }
 
 export interface ApiListSessionsResponse {
@@ -115,7 +108,6 @@ export interface ApiSessionState {
 	contextUsage: ApiContextUsage | null;
 	messages: AgentMessage[];
 	commands: ApiSessionCommand[];
-	pendingAskIds?: string[];
 	pendingUiPromptIds?: string[];
 }
 
@@ -167,26 +159,11 @@ export interface ApiForkSessionResponse {
 	selectedText?: string;
 }
 
-export interface ApiAskQuestion {
-	id: string;
-	question: string;
-	description?: string;
-	options: Array<{ label: string }>;
-	multi?: boolean;
-	recommended?: number;
-}
-
-export interface ApiAskSelection {
-	selectedOptions: string[];
-	customInput?: string;
-}
-
 export type ApiCommandRequest =
 	| { type: "prompt"; clientId: string; text: string; images?: ApiImageContent[]; deliverAs?: "followUp" | "steer" }
 	| { type: "bash"; clientId: string; command: string; excludeFromContext?: boolean }
 	| { type: "abort_bash"; clientId: string }
 	| { type: "compact"; clientId: string; customInstructions?: string }
-	| { type: "ask_response"; clientId: string; askId: string; cancelled?: boolean; selections: ApiAskSelection[] }
 	| { type: "ui_response"; clientId: string; uiId: string; cancelled?: boolean; value?: string }
 	| { type: "abort"; clientId: string }
 	| { type: "set_model"; clientId: string; provider: string; modelId: string }
@@ -264,8 +241,6 @@ export type SseEvent =
 	| { type: "state_patch"; patch: ApiSessionPatch }
 	| { type: "controller_changed"; controllerClientId: string | null }
 	| { type: "released"; byClientId: string }
-	| { type: "ask_request"; askId: string; questions: ApiAskQuestion[] }
-	| { type: "ask_closed"; askId: string; reason: DialogCloseReason }
 	| { type: "ui_select"; uiId: string; title: string; options: string[] }
 	| { type: "ui_input"; uiId: string; title: string; placeholder?: string }
 	| { type: "ui_confirm"; uiId: string; title: string; message: string }

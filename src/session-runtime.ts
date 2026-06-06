@@ -1,9 +1,17 @@
-import { closeSync, existsSync, mkdirSync, openSync, readSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { readFile, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import {
+	ClientSideConnection,
+	PROTOCOL_VERSION,
+	ndJsonStream,
+	type Client,
+	type SessionNotification as AcpSessionNotification,
+} from "@agentclientprotocol/sdk";
+import { createAcpConnection } from "@oh-my-pi/pi-coding-agent/modes/acp";
 import {
 	type AgentMessage,
 	type AgentSession,
@@ -17,9 +25,8 @@ import {
 	type ThinkingLevel,
 } from "./pi-types.ts";
 import { SessionTerminalManager, type TerminalClient } from "./session-terminal.ts";
-import { getGlobalNpmRoot, loadSystemPiModule } from "./system-pi.ts";
+import { getSystemPiEntryPath, loadSystemPiModule } from "./system-pi.ts";
 import type {
-	ApiAskQuestion,
 	ApiCommandRequest,
 	ApiCreateSessionRequest,
 	ApiForkSessionRequest,
@@ -51,11 +58,10 @@ const {
 	createGrepTool,
 	createFindTool,
 	createLsTool,
-	DefaultResourceLoader,
 	getAgentDir,
 	ModelRegistry,
 	SessionManager,
-	SettingsManager,
+	Settings,
 	readTool,
 	bashTool,
 	editTool,
@@ -195,32 +201,48 @@ function resolveModelById(modelIdOrScope: string, modelRegistry: PiModelRegistry
 
 async function loadSubagentManagementModule() {
 	if (subagentManagementModulePromise !== null) return subagentManagementModulePromise;
-	const root = getGlobalNpmRoot();
-	if (!root) {
-		subagentManagementModulePromise = Promise.resolve(null);
-		return subagentManagementModulePromise;
-	}
-	subagentManagementModulePromise = import(join(root, "pi-subagents", "agent-management.ts")).then(
-		(mod) => (typeof mod.findAgents === "function" ? mod : null),
-		() => null,
-	);
+	const packageRoot = dirname(getSystemPiEntryPath());
+	const { discoverAgents } = await import(join(packageRoot, "task", "discovery.ts"));
+	subagentManagementModulePromise = Promise.resolve({
+		findAgents: async (name: string, cwd: string) => {
+			const { agents } = await discoverAgents(cwd);
+			const target = name.trim().toLowerCase();
+			return agents.filter((a) => a.name.toLowerCase() === target);
+		},
+	});
 	return subagentManagementModulePromise;
 }
 
 async function loadSubagentSkillsModule() {
 	if (subagentSkillsModulePromise !== null) return subagentSkillsModulePromise;
-	const root = getGlobalNpmRoot();
-	if (!root) {
-		subagentSkillsModulePromise = Promise.resolve(null);
-		return subagentSkillsModulePromise;
-	}
-	subagentSkillsModulePromise = import(join(root, "pi-subagents", "skills.ts")).then(
-		(mod) =>
-			typeof mod.resolveSkills === "function" && typeof mod.buildSkillInjection === "function"
-				? mod
-				: null,
-		() => null,
-	);
+	const packageRoot = dirname(getSystemPiEntryPath());
+	const { loadSkills, buildSkillPromptMessage } = await import(join(packageRoot, "extensibility", "skills.ts"));
+	subagentSkillsModulePromise = Promise.resolve({
+		resolveSkills: async (skillNames: string[], cwd: string) => {
+			const { skills } = await loadSkills({ cwd });
+			const resolved: any[] = [];
+			const missing: string[] = [];
+			for (const name of skillNames) {
+				const found = skills.find((s) => s.name === name);
+				if (found) {
+					resolved.push(found);
+				} else {
+					missing.push(name);
+				}
+			}
+			return { resolved, missing };
+		},
+		buildSkillInjection: async (resolvedSkills: any[]) => {
+			const parts: string[] = [];
+			for (const skill of resolvedSkills) {
+				const built = await buildSkillPromptMessage(skill, "");
+				if (built?.message) {
+					parts.push(built.message);
+				}
+			}
+			return parts.join("\n\n");
+		},
+	});
 	return subagentSkillsModulePromise;
 }
 
@@ -235,7 +257,7 @@ async function resolveStartAgentConfig(
 	const management = await loadSubagentManagementModule();
 	if (!management) throw new Error("start agent support is unavailable");
 
-	const candidates = management.findAgents(trimmed, cwd, "both");
+	const candidates = await management.findAgents(trimmed, cwd, "both");
 	if (!Array.isArray(candidates) || candidates.length === 0) {
 		throw new Error(`Unknown start agent: ${trimmed}`);
 	}
@@ -245,15 +267,16 @@ async function resolveStartAgentConfig(
 	if (typeof selected.systemPrompt === "string" && selected.systemPrompt.trim()) {
 		promptParts.push(selected.systemPrompt.trim());
 	}
-	if (Array.isArray(selected.skills) && selected.skills.length > 0) {
+	const skillsToLoad = selected.autoloadSkills || (selected as any).skills || [];
+	if (Array.isArray(skillsToLoad) && skillsToLoad.length > 0) {
 		const skillsModule = await loadSubagentSkillsModule();
 		if (!skillsModule) throw new Error(`Unable to resolve skills for start agent: ${selected.name}`);
-		const result = skillsModule.resolveSkills(selected.skills, cwd);
+		const result = await skillsModule.resolveSkills(skillsToLoad, cwd);
 		if (result.missing.length > 0) {
 			throw new Error(`Unknown skills for start agent '${selected.name}': ${result.missing.join(", ")}`);
 		}
 		if (result.resolved.length > 0) {
-			const injected = skillsModule.buildSkillInjection(result.resolved);
+			const injected = await skillsModule.buildSkillInjection(result.resolved);
 			if (injected) promptParts.push(injected);
 		}
 	}
@@ -266,20 +289,21 @@ async function resolveStartAgentConfig(
 
 	let model: Model<Api> | undefined;
 	let thinkingLevel: ThinkingLevel | undefined;
-	if (typeof selected.model === "string" && selected.model.trim()) {
-		const resolvedModel = resolveModelById(selected.model, modelRegistry);
+	const selectedModel = Array.isArray(selected.model) ? selected.model[0] : selected.model;
+	if (typeof selectedModel === "string" && selectedModel.trim()) {
+		const resolvedModel = resolveModelById(selectedModel, modelRegistry);
 		if (!resolvedModel.model) {
-			throw new Error(`Unknown model for start agent '${selected.name}': ${selected.model}`);
+			throw new Error(`Unknown model for start agent '${selected.name}': ${selectedModel}`);
 		}
 		model = resolvedModel.model;
 		thinkingLevel = resolvedModel.thinkingLevel;
 	}
 
-	const overrideThinking = normalizeThinkingLevel(selected.thinking);
+	const overrideThinking = normalizeThinkingLevel(selected.thinkingLevel || (selected as any).thinking);
 	if (overrideThinking) thinkingLevel = overrideThinking;
 
-	const extensions = Array.isArray(selected.extensions)
-		? selected.extensions.map((value: string) => value.trim()).filter(Boolean)
+	const extensions = Array.isArray((selected as any).extensions)
+		? (selected as any).extensions.map((value: string) => value.trim()).filter(Boolean)
 		: undefined;
 
 	const systemPrompt = promptParts.length > 0 ? promptParts.join("\n\n") : undefined;
@@ -293,16 +317,26 @@ async function resolveStartAgentConfig(
 	};
 }
 
-function buildSessionResourceLoader(cwd: string, startAgentConfig: ResolvedStartAgentConfig | null): PiDefaultResourceLoader {
-	const info = parseWorktreeInfo(cwd);
+async function createSessionWithWorktreeGuard(opts: {
+	cwd: string;
+	sessionManager: PiSessionManager;
+	authStorage: PiAuthStorage;
+	modelRegistry: PiModelRegistry;
+	startAgent?: string;
+}): Promise<{
+	session: AgentSession;
+	startAgentConfig: ResolvedStartAgentConfig | null;
+	setToolUIContext?: (uiContext: any, hasUI: boolean) => void;
+}> {
+	const startAgentConfig = await resolveStartAgentConfig(opts.cwd, opts.startAgent, opts.modelRegistry);
 	const agentDir = getAgentDir();
-	const settingsManager = SettingsManager.create(cwd, agentDir);
+	const baseSettings = await Settings.init({ agentDir });
+	const settingsManager = await baseSettings.cloneForCwd(opts.cwd);
+
+	const info = parseWorktreeInfo(opts.cwd);
 	const systemPromptOverride =
 		typeof startAgentConfig?.systemPrompt === "string" && startAgentConfig.systemPrompt.trim()
-			? (base: string | undefined) => {
-				const basePrompt = typeof base === "string" ? base.trim() : "";
-				return basePrompt ? `${basePrompt}\n\n${startAgentConfig.systemPrompt}` : startAgentConfig.systemPrompt;
-			}
+			? (base: string[]) => [...base, startAgentConfig.systemPrompt!.trim()]
 			: undefined;
 
 	const appendSystemPromptOverride = info
@@ -312,41 +346,30 @@ function buildSessionResourceLoader(cwd: string, startAgentConfig: ResolvedStart
 		]
 		: undefined;
 
-	return new DefaultResourceLoader({
-		cwd,
-		agentDir,
-		settingsManager,
-		...(systemPromptOverride ? { systemPromptOverride } : {}),
-		...(appendSystemPromptOverride ? { appendSystemPromptOverride } : {}),
-		...(startAgentConfig?.extensions && startAgentConfig.extensions.length > 0
-			? { additionalExtensionPaths: startAgentConfig.extensions }
-			: {}),
-	});
-}
+	const systemPrompt = (base: string[]) => {
+		let result = base;
+		if (systemPromptOverride) result = systemPromptOverride(result);
+		if (appendSystemPromptOverride) result = appendSystemPromptOverride(result);
+		return result;
+	};
 
-async function createSessionWithWorktreeGuard(opts: {
-	cwd: string;
-	sessionManager: PiSessionManager;
-	authStorage: PiAuthStorage;
-	modelRegistry: PiModelRegistry;
-	startAgent?: string;
-}): Promise<{ session: AgentSession; startAgentConfig: ResolvedStartAgentConfig | null }> {
-	const startAgentConfig = await resolveStartAgentConfig(opts.cwd, opts.startAgent, opts.modelRegistry);
-	const loader = buildSessionResourceLoader(opts.cwd, startAgentConfig);
-	if (loader) await loader.reload();
 	const tools = startAgentConfig?.tools ? resolveSessionToolSelection(opts.cwd, startAgentConfig.tools) : undefined;
-	const { session } = await createAgentSession({
+	const { session, setToolUIContext } = await createAgentSession({
 		cwd: opts.cwd,
 		authStorage: opts.authStorage,
 		modelRegistry: opts.modelRegistry,
 		sessionManager: opts.sessionManager,
-		settingsManager: SettingsManager.create(opts.cwd, getAgentDir()),
-		resourceLoader: loader,
+		settings: settingsManager,
+		systemPrompt,
+		hasUI: true,
 		...(tools ? { tools } : {}),
 		...(startAgentConfig?.model ? { model: startAgentConfig.model } : {}),
 		...(startAgentConfig?.thinkingLevel ? { thinkingLevel: startAgentConfig.thinkingLevel } : {}),
+		...(startAgentConfig?.extensions && startAgentConfig.extensions.length > 0
+			? { additionalExtensionPaths: startAgentConfig.extensions }
+			: {}),
 	} as any);
-	return { session, startAgentConfig };
+	return { session, startAgentConfig, setToolUIContext };
 }
 
 // ---------------------------------------------------------------------------
@@ -373,6 +396,62 @@ export interface PiWebRuntimeOptions {
 	onMessageNotification?: (payload: SessionNotification) => void | Promise<void>;
 }
 
+interface AcpRuntimeBridge {
+	client: ClientSideConnection;
+	agentConnection: ReturnType<typeof createAcpConnection>;
+	state: AcpRuntimeState;
+}
+
+interface AcpModelOption {
+	modelId: string;
+	name?: string;
+	description?: string;
+}
+
+interface AcpRuntimeState {
+	models?: {
+		availableModels: AcpModelOption[];
+		currentModelId?: string;
+	};
+	configOptions?: unknown[];
+	commands?: ApiSessionCommand[];
+}
+
+class InMemoryTransportPair {
+	private readonly clientToAgent = new TransformStream();
+	private readonly agentToClient = new TransformStream();
+
+	readonly clientStream = ndJsonStream(this.clientToAgent.writable, this.agentToClient.readable);
+	readonly agentStream = ndJsonStream(this.agentToClient.writable, this.clientToAgent.readable);
+}
+
+class PiWebAcpClient implements Client {
+	constructor(
+		private readonly onSessionUpdate: (params: AcpSessionNotification) => void,
+		private readonly onCreateElicitation: (params: unknown) => Promise<unknown>,
+	) {}
+
+	async requestPermission(params: Parameters<Client["requestPermission"]>[0]): Promise<ReturnType<Client["requestPermission"]> extends Promise<infer T> ? T : never> {
+		const allow = params.options.find((option) => option.kind === "allow_always" || option.kind === "allow_once") ?? params.options[0];
+		if (!allow) return { outcome: { outcome: "cancelled" } } as any;
+		return { outcome: { outcome: "selected", optionId: allow.optionId } } as any;
+	}
+
+	async sessionUpdate(params: AcpSessionNotification): Promise<void> {
+		this.onSessionUpdate(params);
+	}
+
+	async unstable_createElicitation(params: unknown): Promise<unknown> {
+		return this.onCreateElicitation(params);
+	}
+
+	async extMethod(_method: string, _params: Record<string, unknown>): Promise<Record<string, unknown>> {
+		return {};
+	}
+
+	async extNotification(_method: string, _params: Record<string, unknown>): Promise<void> {}
+}
+
 interface RunningSession {
 	session: AgentSession;
 	cwd: string;
@@ -385,6 +464,7 @@ interface RunningSession {
 	unsubscribe: (() => void) | null;
 	lastAssistantMessageText: string;
 	startAgent?: string;
+	acp: AcpRuntimeBridge;
 }
 
 function extractTextContent(content: unknown): string {
@@ -751,9 +831,50 @@ function toIso(ms: number): string {
 	return new Date(ms).toISOString();
 }
 
+function modelSnapshotFromKey(session: AgentSession, modelKey: unknown): ApiSessionState["model"] {
+	const parsed = splitAcpModelId(typeof modelKey === "string" ? modelKey : undefined);
+	if (!parsed) return null;
+	let name: string | undefined;
+	try {
+		const match = typeof session.getAvailableModels === "function"
+			? session.getAvailableModels().find((model: Model<Api>) => model.provider === parsed.provider && model.id === parsed.id)
+			: undefined;
+		name = typeof match?.name === "string" ? match.name : undefined;
+	} catch {}
+	return {
+		provider: parsed.provider,
+		id: parsed.id,
+		...(name ? { name } : {}),
+	};
+}
+
+function modelSnapshotFromSessionHistory(session: AgentSession): ApiSessionState["model"] {
+	try {
+		const branch = typeof session.sessionManager?.getBranch === "function" ? session.sessionManager.getBranch() : [];
+		if (Array.isArray(branch)) {
+			for (let i = branch.length - 1; i >= 0; i -= 1) {
+				const entry = branch[i];
+				if (entry?.type !== "model_change") continue;
+				const snapshot = modelSnapshotFromKey(session, entry.model ?? `${entry.provider ?? ""}/${entry.modelId ?? ""}`);
+				if (snapshot) return snapshot;
+			}
+		}
+	} catch {}
+
+	const messages = Array.isArray(session.messages) ? session.messages : [];
+	for (let i = messages.length - 1; i >= 0; i -= 1) {
+		const message = messages[i] as { provider?: unknown; model?: unknown };
+		const provider = typeof message?.provider === "string" ? message.provider : "";
+		const model = typeof message?.model === "string" ? message.model : "";
+		const snapshot = modelSnapshotFromKey(session, provider && model ? `${provider}/${model}` : undefined);
+		if (snapshot) return snapshot;
+	}
+	return null;
+}
+
 function safeModelSnapshot(session: AgentSession): ApiSessionState["model"] {
 	const model = session.model;
-	if (!model) return null;
+	if (!model) return modelSnapshotFromSessionHistory(session);
 	const name = typeof (model as { name?: unknown }).name === "string" ? (model as { name: string }).name : undefined;
 	return { provider: model.provider, id: model.id, name };
 }
@@ -814,6 +935,20 @@ function safeCommandsSnapshot(session: AgentSession): ApiSessionCommand[] {
 		}
 
 		// 2. Prompt templates (public getter)
+		const customCommands = Array.isArray((session as any).customCommands) ? (session as any).customCommands : [];
+		for (const entry of customCommands) {
+			const command = (entry as any)?.command ?? entry;
+			const name = typeof command?.name === "string" ? command.name.trim() : "";
+			if (!name || seen.has(name)) continue;
+			seen.add(name);
+			result.push({
+				name,
+				description: typeof command?.description === "string" ? command.description.trim() || undefined : undefined,
+				source: "extension",
+			});
+		}
+
+		// 3. Prompt templates (public getter)
 		const templates = session.promptTemplates;
 		if (Array.isArray(templates)) {
 			for (const tpl of templates) {
@@ -828,26 +963,22 @@ function safeCommandsSnapshot(session: AgentSession): ApiSessionCommand[] {
 			}
 		}
 
-		// 3. Skills via private _resourceLoader
-		const resourceLoader = (session as any)._resourceLoader;
-		if (resourceLoader && typeof resourceLoader.getSkills === "function") {
-			const skillsResult = resourceLoader.getSkills();
-			const skills = Array.isArray(skillsResult?.skills) ? skillsResult.skills : [];
-			for (const skill of skills) {
-				const name = typeof skill?.name === "string" ? skill.name.trim() : "";
-				if (!name) continue;
-				const fullName = `skill:${name}`;
-				if (seen.has(fullName)) continue;
-				seen.add(fullName);
-				result.push({
-					name: fullName,
-					description: typeof skill?.description === "string" ? skill.description.trim() || undefined : undefined,
-					source: "skill",
-				});
-			}
+		// 4. Skills via session.skills
+		const skills = Array.isArray((session as any).skills) ? (session as any).skills : [];
+		for (const skill of skills) {
+			const name = typeof skill?.name === "string" ? skill.name.trim() : "";
+			if (!name) continue;
+			const fullName = `skill:${name}`;
+			if (seen.has(fullName)) continue;
+			seen.add(fullName);
+			result.push({
+				name: fullName,
+				description: typeof skill?.description === "string" ? skill.description.trim() || undefined : undefined,
+				source: "skill",
+			});
 		}
 
-		// 4. Built-in pi commands
+		// 5. Local mobile commands
 		for (const cmd of BUILTIN_COMMANDS) {
 			if (!seen.has(cmd.name)) {
 				seen.add(cmd.name);
@@ -859,6 +990,174 @@ function safeCommandsSnapshot(session: AgentSession): ApiSessionCommand[] {
 	} catch {
 		return [];
 	}
+}
+
+function getSlashCommandName(text: string): string | null {
+	const match = text.trim().match(/^\/([A-Za-z0-9_:-]+)/);
+	return match ? match[1]!.toLowerCase() : null;
+}
+
+function isSessionCustomSlashCommand(session: AgentSession, text: string): boolean {
+	const name = getSlashCommandName(text);
+	if (!name) return false;
+	const customCommands = Array.isArray((session as any).customCommands) ? (session as any).customCommands : [];
+	return customCommands.some((entry: any) => {
+		const commandName = typeof entry?.command?.name === "string" ? entry.command.name.trim().toLowerCase() : "";
+		return commandName === name;
+	});
+}
+
+function normalizeAcpCommand(command: unknown): ApiSessionCommand | null {
+	if (!command || typeof command !== "object") return null;
+	const rawName = typeof (command as { name?: unknown }).name === "string"
+		? (command as { name: string }).name.trim()
+		: "";
+	const name = rawName.replace(/^\/+/, "");
+	if (!name) return null;
+	const description = typeof (command as { description?: unknown }).description === "string"
+		? (command as { description: string }).description.trim()
+		: "";
+	return {
+		name,
+		...(description ? { description } : {}),
+		source: "extension",
+	};
+}
+
+function mergeCommands(primary: ApiSessionCommand[] | undefined, fallback: ApiSessionCommand[]): ApiSessionCommand[] {
+	const result: ApiSessionCommand[] = [];
+	const seen = new Set<string>();
+	for (const command of [...(primary ?? []), ...fallback]) {
+		const name = typeof command?.name === "string" ? command.name.trim() : "";
+		if (!name || seen.has(name)) continue;
+		seen.add(name);
+		result.push(command);
+	}
+	return result;
+}
+
+function splitAcpModelId(modelId: string | undefined): { provider: string; id: string } | null {
+	const trimmed = typeof modelId === "string" ? modelId.trim() : "";
+	const slash = trimmed.indexOf("/");
+	if (slash <= 0 || slash >= trimmed.length - 1) return null;
+	return {
+		provider: trimmed.slice(0, slash),
+		id: trimmed.slice(slash + 1),
+	};
+}
+
+function modelStateFromConfigOptions(configOptions: unknown[]): AcpRuntimeState["models"] | undefined {
+	for (const option of configOptions) {
+		if (!option || typeof option !== "object") continue;
+		const typed = option as { id?: unknown; category?: unknown; currentValue?: unknown; options?: unknown };
+		const id = typeof typed.id === "string" ? typed.id.toLowerCase() : "";
+		const category = typeof typed.category === "string" ? typed.category.toLowerCase() : "";
+		if (id !== "model" && category !== "model") continue;
+		const options = Array.isArray(typed.options) ? typed.options : [];
+		const availableModels = options
+			.map((entry): AcpModelOption | null => {
+				if (!entry || typeof entry !== "object") return null;
+				const modelId = typeof (entry as { value?: unknown }).value === "string"
+					? (entry as { value: string }).value.trim()
+					: "";
+				if (!modelId) return null;
+				const name = typeof (entry as { name?: unknown }).name === "string" ? (entry as { name: string }).name : undefined;
+				const description = typeof (entry as { description?: unknown }).description === "string"
+					? (entry as { description: string }).description
+					: undefined;
+				return { modelId, ...(name ? { name } : {}), ...(description ? { description } : {}) };
+			})
+			.filter((entry): entry is AcpModelOption => entry !== null);
+		const currentModelId = typeof typed.currentValue === "string" ? typed.currentValue.trim() : undefined;
+		return { availableModels, currentModelId };
+	}
+	return undefined;
+}
+
+function applyAcpSessionUpdate(state: AcpRuntimeState, params: AcpSessionNotification): void {
+	const update = (params as { update?: unknown }).update;
+	if (!update || typeof update !== "object") return;
+	const typed = update as {
+		sessionUpdate?: unknown;
+		availableCommands?: unknown;
+		configOptions?: unknown;
+		models?: unknown;
+	};
+
+	if (Array.isArray(typed.configOptions)) {
+		state.configOptions = typed.configOptions;
+		const modelState = modelStateFromConfigOptions(typed.configOptions);
+		if (modelState) state.models = modelState;
+	}
+
+	if (typed.models && typeof typed.models === "object") {
+		const models = typed.models as { availableModels?: unknown; currentModelId?: unknown };
+		const availableModels = Array.isArray(models.availableModels)
+			? models.availableModels
+				.map((entry): AcpModelOption | null => {
+					if (!entry || typeof entry !== "object") return null;
+					const modelId = typeof (entry as { modelId?: unknown }).modelId === "string"
+						? (entry as { modelId: string }).modelId.trim()
+						: "";
+					if (!modelId) return null;
+					const name = typeof (entry as { name?: unknown }).name === "string" ? (entry as { name: string }).name : undefined;
+					const description = typeof (entry as { description?: unknown }).description === "string"
+						? (entry as { description: string }).description
+						: undefined;
+					return { modelId, ...(name ? { name } : {}), ...(description ? { description } : {}) };
+				})
+				.filter((entry): entry is AcpModelOption => entry !== null)
+			: [];
+		const currentModelId = typeof models.currentModelId === "string" ? models.currentModelId.trim() : undefined;
+		state.models = { availableModels, currentModelId };
+	}
+
+	if (Array.isArray(typed.availableCommands)) {
+		state.commands = typed.availableCommands
+			.map(normalizeAcpCommand)
+			.filter((command): command is ApiSessionCommand => command !== null);
+	}
+}
+
+function applyAcpResponseState(state: AcpRuntimeState, response: unknown): void {
+	if (!response || typeof response !== "object") return;
+	const typed = response as { configOptions?: unknown; models?: unknown; availableCommands?: unknown };
+	applyAcpSessionUpdate(state, {
+		sessionId: "",
+		update: {
+			sessionUpdate: "config_option_update",
+			...(Array.isArray(typed.configOptions) ? { configOptions: typed.configOptions } : {}),
+			...(typed.models ? { models: typed.models } : {}),
+			...(Array.isArray(typed.availableCommands) ? { availableCommands: typed.availableCommands } : {}),
+		},
+	} as AcpSessionNotification);
+}
+
+function acpModelSnapshot(state: AcpRuntimeState): ApiSessionState["model"] {
+	const currentModelId = state.models?.currentModelId;
+	const parsed = splitAcpModelId(currentModelId);
+	if (!parsed) return null;
+	const modelInfo = state.models?.availableModels.find((model) => model.modelId === currentModelId);
+	return {
+		provider: parsed.provider,
+		id: parsed.id,
+		...(modelInfo?.name ? { name: modelInfo.name } : {}),
+	};
+}
+
+function overlayAcpState<T extends ApiSessionState | ApiSessionPatch>(
+	base: T,
+	state: AcpRuntimeState | undefined,
+	fallbackCommands: ApiSessionCommand[],
+): T {
+	if (!state) return base;
+	const model = acpModelSnapshot(state);
+	const commands = mergeCommands(state.commands, fallbackCommands);
+	return {
+		...base,
+		...(model ? { model } : {}),
+		commands,
+	};
 }
 
 function toMessageTimestamp(timestamp: unknown): number {
@@ -952,6 +1251,18 @@ function buildPatch(session: AgentSession): ApiSessionPatch {
 	};
 }
 
+function buildRuntimeState(runtime: RunningSession, includeFullHistory = false, messageLimit = 0): ApiSessionState {
+	const fallbackCommands = safeCommandsSnapshot(runtime.session);
+	const state = buildState(runtime.session, runtime.cwd, includeFullHistory, runtime.startAgent, messageLimit);
+	return overlayAcpState(state, runtime.acp?.state, fallbackCommands);
+}
+
+function buildRuntimePatch(runtime: RunningSession): ApiSessionPatch {
+	const fallbackCommands = safeCommandsSnapshot(runtime.session);
+	const patch = buildPatch(runtime.session);
+	return overlayAcpState(patch, runtime.acp?.state, fallbackCommands);
+}
+
 async function ensureDirectory(path: string): Promise<void> {
 	let info: { isDirectory(): boolean };
 	try {
@@ -996,12 +1307,9 @@ function readSessionHeaderCwd(path: string): string | null {
 	}
 }
 
-function openSessionManagerFast(path: string, sessionDir?: string): PiSessionManager {
+async function openSessionManagerFast(path: string, sessionDir?: string): Promise<PiSessionManager> {
 	const resolvedPath = resolve(path);
-	const dir = sessionDir ?? dirname(resolvedPath);
-	const cwd = readSessionHeaderCwd(resolvedPath) ?? process.cwd();
-	const SessionManagerCtor = SessionManager as unknown as new (cwd: string, sessionDir: string, sessionFile: string, persist: boolean) => PiSessionManager;
-	return new SessionManagerCtor(cwd, dir, resolvedPath, true);
+	return await SessionManager.open(resolvedPath, sessionDir);
 }
 
 function serializeSessionSummary(entry: {
@@ -1029,13 +1337,6 @@ function serializeSessionSummary(entry: {
 	};
 }
 
-interface PendingAsk {
-	resolve: (value: { cancelled?: boolean; selections: Array<{ selectedOptions: string[]; customInput?: string }> }) => boolean;
-	close: (reason: DialogCloseReason) => boolean;
-	sessionId: string;
-	questions: ApiAskQuestion[];
-}
-
 type PendingUiPromptEvent = Extract<SseEvent, { type: "ui_select" | "ui_input" | "ui_confirm" }>;
 
 interface PendingUiPrompt {
@@ -1049,17 +1350,77 @@ export class PiWebRuntime {
 	private runningById = new Map<string, RunningSession>();
 	private runningByPath = new Map<string, string>();
 	private onMessageNotification?: (payload: SessionNotification) => void | Promise<void>;
-	private pendingAsks = new Map<string, PendingAsk>();
 	private pendingUiPrompts = new Map<string, PendingUiPrompt>();
+	private globalTerminalManager = new SessionTerminalManager({ sessionId: "scratch", cwd: homedir(), canWrite: () => true });
 
 	constructor(options: PiWebRuntimeOptions = {}) {
 		this.onMessageNotification = options.onMessageNotification;
-		this.installAskAdapter();
+		try {
+			if (existsSync(this.archiveStorePath)) {
+				const raw = readFileSync(this.archiveStorePath, "utf8");
+				const parsed = JSON.parse(raw);
+				if (Array.isArray(parsed)) {
+					this.archivedSessionIds = new Set(parsed.filter((id) => typeof id === "string"));
+				}
+			}
+		} catch (err) {
+			console.error("Failed to load archive list:", err);
+		}
 	}
 
-	private installAskAdapter(): void {
-		// jiti sandboxes globalThis so __piTelegramAskAdapter doesn't work.
-		// Instead we wrap the ask tool's execute after each session is created.
+	private async createAcpBridge(session: AgentSession, cwd: string, startAgent: string | undefined): Promise<AcpRuntimeBridge> {
+		const transport = new InMemoryTransportPair();
+		const acpState: AcpRuntimeState = {};
+		let firstSession: AgentSession | null = session;
+		const createSession = async (nextCwd: string): Promise<AgentSession> => {
+			if (firstSession) {
+				const prepared = firstSession;
+				firstSession = null;
+				return prepared;
+			}
+			const sessionManager = SessionManager.create(nextCwd);
+			const result = await createSessionWithWorktreeGuard({
+				cwd: nextCwd,
+				sessionManager,
+				authStorage: await this.getAuthStorage(),
+				modelRegistry: await this.getModelRegistry(),
+				startAgent,
+			});
+			this.bindSessionUi(result.session, result.setToolUIContext);
+			return result.session;
+		};
+		const onSessionUpdate = (params: AcpSessionNotification) => {
+			const runtime = this.runningById.get(params.sessionId);
+			applyAcpSessionUpdate(acpState, params);
+			if (!runtime) return;
+			runtime.modifiedAtMs = Date.now();
+			this.broadcast(params.sessionId, { type: "state_patch", patch: buildRuntimePatch(runtime) });
+		};
+		const client = new ClientSideConnection(
+			() => new PiWebAcpClient(
+				onSessionUpdate,
+				(params) => this.handleAcpElicitation(params),
+			),
+			transport.clientStream,
+		);
+		const agentConnection = createAcpConnection(
+			transport.agentStream,
+			createSession,
+		);
+		await client.initialize({
+			protocolVersion: PROTOCOL_VERSION,
+			clientCapabilities: {
+				fs: { readTextFile: false, writeTextFile: false },
+				terminal: false,
+				elicitation: { form: {} },
+			},
+		});
+		const response = await client.newSession({ cwd, mcpServers: [] });
+		applyAcpResponseState(acpState, response);
+		if (response.sessionId !== session.sessionId) {
+			throw new Error(`acp_session_mismatch: ${response.sessionId} !== ${session.sessionId}`);
+		}
+		return { client, agentConnection, state: acpState };
 	}
 
 	private getClientConnections(runtime: RunningSession, clientId: string): SessionClient[] {
@@ -1107,15 +1468,6 @@ export class PiWebRuntime {
 		if (!client) return;
 		if (runtime.controllerClientId !== client.clientId) return;
 
-		for (const [askId, pending] of this.pendingAsks.entries()) {
-			if (pending.sessionId !== sessionId) continue;
-			this.sendToConnection(sessionId, connectionId, {
-				type: "ask_request",
-				askId,
-				questions: pending.questions,
-			});
-		}
-
 		for (const pending of this.pendingUiPrompts.values()) {
 			if (pending.sessionId !== sessionId) continue;
 			this.sendToConnection(sessionId, connectionId, pending.event);
@@ -1130,95 +1482,17 @@ export class PiWebRuntime {
 		this.replayPendingDialogs(sessionId, client.connectionId);
 	}
 
-	private wrapAskTool(session: AgentSession, sessionId: string): void {
-		const runner = (session as any)._extensionRunner;
-		if (!runner) return;
-
-		// Find the ask tool and wrap its execute
-		for (const ext of (runner as any).extensions ?? []) {
-			const askTool = ext.tools?.get?.("ask");
-			if (!askTool?.definition?.execute) continue;
-
-			const originalExecute = askTool.definition.execute;
-			const self = this;
-			askTool.definition.execute = async function (toolCallId: string, params: any, signal: any, onUpdate: any, ctx: any) {
-				if (params?.questions?.length > 0) {
-					const askId = randomUUID();
-					const questions: ApiAskQuestion[] = Array.isArray(params.questions)
-						? params.questions.map((q: any) => ({
-							id: typeof q?.id === "string" ? q.id : "",
-							question: typeof q?.question === "string" ? q.question : "",
-							...(typeof q?.description === "string" && q.description.trim() ? { description: q.description } : {}),
-							options: Array.isArray(q?.options)
-								? q.options
-									.map((o: any) => ({ label: typeof o?.label === "string" ? o.label : String(o?.label ?? "") }))
-									.filter((o: { label: string }) => o.label.length > 0)
-								: [],
-							...(typeof q?.multi === "boolean" ? { multi: q.multi } : {}),
-							...(typeof q?.recommended === "number" && Number.isFinite(q.recommended) ? { recommended: q.recommended } : {}),
-						}))
-						: [];
-
-					const result = await new Promise<{ cancelled?: boolean; selections: Array<{ selectedOptions: string[]; customInput?: string }> }>((resolve) => {
-						let done = false;
-						const finish = (value: { cancelled?: boolean; selections: Array<{ selectedOptions: string[]; customInput?: string }> }) => {
-							if (done) return false;
-							done = true;
-							self.pendingAsks.delete(askId);
-							if (signal && typeof signal.removeEventListener === "function") {
-								signal.removeEventListener("abort", onAbort);
-							}
-							resolve(value);
-							return true;
-						};
-						const close = (reason: DialogCloseReason) => {
-							const closed = finish({ cancelled: true, selections: [] });
-							if (closed) self.sendToController(sessionId, { type: "ask_closed", askId, reason });
-							return closed;
-						};
-						const onAbort = () => close("aborted");
-						self.pendingAsks.set(askId, { resolve: finish, close, sessionId, questions });
-						self.sendToController(sessionId, { type: "ask_request", askId, questions });
-						if (signal?.aborted) close("aborted");
-						else if (signal && typeof signal.addEventListener === "function") signal.addEventListener("abort", onAbort, { once: true });
-					});
-
-					const results = questions.map((q: any, i: number) => {
-						const sel = result.selections[i] ?? { selectedOptions: [] };
-						return {
-							id: q.id,
-							question: q.question,
-							...(q.description?.trim() ? { description: q.description } : {}),
-							options: q.options.map((o: any) => o.label),
-							multi: q.multi ?? false,
-							selectedOptions: result.cancelled ? [] : sel.selectedOptions,
-							customInput: sel.customInput,
-						};
-					});
-
-					const summaryLines = results.map((r: any) => {
-						const selected = r.selectedOptions.length > 0
-							? (r.multi ? `[${r.selectedOptions.join(", ")}]` : r.selectedOptions[0])
-							: r.customInput ? `"${r.customInput}"` : "(cancelled)";
-						return `${r.id}: ${selected}`;
-					}).join("\n");
-
-					return {
-						content: [{ type: "text", text: `User answers:\n${summaryLines}` }],
-						details: questions.length === 1 ? results[0] : { results },
-					};
-				}
-
-				return originalExecute.call(this, toolCallId, params, signal, onUpdate, ctx);
-			};
-			break;
-		}
-	}
-
-	resolveAsk(sessionId: string, askId: string, cancelled: boolean, selections: Array<{ selectedOptions: string[]; customInput?: string }>): boolean {
-		const pending = this.pendingAsks.get(askId);
-		if (!pending || pending.sessionId !== sessionId) return false;
-		return pending.resolve({ cancelled, selections });
+	private bindSessionUi(session: AgentSession, setToolUIContext?: (uiContext: any, hasUI: boolean) => void): void {
+		const uiContext = this.createWebUIContext(session.sessionId);
+		try {
+			setToolUIContext?.(uiContext, true);
+		} catch {}
+		try {
+			const binder = (session as any).bindExtensions;
+			if (typeof binder === "function") {
+				void binder.call(session, { uiContext });
+			}
+		} catch {}
 	}
 
 	resolveUiPrompt(sessionId: string, uiId: string, cancelled: boolean, value?: string): boolean {
@@ -1228,54 +1502,125 @@ export class PiWebRuntime {
 	}
 
 	private cancelPendingDialogsForSession(sessionId: string, reason: DialogCloseReason = "aborted"): void {
-		for (const pending of this.pendingAsks.values()) {
-			if (pending.sessionId !== sessionId) continue;
-			pending.close(reason);
-		}
 		for (const pending of this.pendingUiPrompts.values()) {
 			if (pending.sessionId !== sessionId) continue;
 			pending.close(reason);
 		}
 	}
 
+	private waitForUiPrompt(sessionId: string, event: PendingUiPromptEvent): Promise<string | undefined> {
+		const self = this;
+		const uiId = event.uiId;
+		return new Promise<string | undefined>((resolve) => {
+			let done = false;
+			const finish = (value: string | undefined) => {
+				if (done) return false;
+				done = true;
+				self.pendingUiPrompts.delete(uiId);
+				resolve(value);
+				return true;
+			};
+			const close = (reason: DialogCloseReason) => {
+				const closed = finish(undefined);
+				if (closed) self.sendToController(sessionId, { type: "ui_prompt_closed", uiId, reason });
+				return closed;
+			};
+			self.pendingUiPrompts.set(uiId, { resolve: finish, close, sessionId, event });
+			self.sendToController(sessionId, event);
+		});
+	}
+
+	private async handleAcpElicitation(params: unknown): Promise<unknown> {
+		if (!params || typeof params !== "object") return { action: "cancel" };
+		const request = params as {
+			mode?: unknown;
+			sessionId?: unknown;
+			message?: unknown;
+			requestedSchema?: { properties?: Record<string, unknown> };
+		};
+		if (request.mode !== "form") return { action: "cancel" };
+		const sessionId = typeof request.sessionId === "string" ? request.sessionId : "";
+		if (!sessionId || !this.runningById.has(sessionId)) return { action: "cancel" };
+
+		const message = typeof request.message === "string" && request.message.trim()
+			? request.message.trim()
+			: "Choose";
+		const properties = request.requestedSchema?.properties ?? {};
+		const valueProperty = properties.value as {
+			type?: unknown;
+			enum?: unknown;
+			oneOf?: unknown;
+			description?: unknown;
+			default?: unknown;
+		} | undefined;
+		if (!valueProperty || typeof valueProperty !== "object") return { action: "cancel" };
+
+		const uiId = randomUUID();
+		let value: string | undefined;
+		if (Array.isArray(valueProperty.oneOf) || Array.isArray(valueProperty.enum)) {
+			const options = Array.isArray(valueProperty.oneOf)
+				? valueProperty.oneOf
+					.map((option) => {
+						if (!option || typeof option !== "object") return "";
+						const typed = option as { const?: unknown; title?: unknown };
+						return typeof typed.title === "string" ? typed.title : typeof typed.const === "string" ? typed.const : "";
+					})
+					.filter(Boolean)
+				: (valueProperty.enum as unknown[])
+					.map((option) => typeof option === "string" ? option : "")
+					.filter(Boolean);
+			if (options.length === 0) return { action: "cancel" };
+			value = await this.waitForUiPrompt(sessionId, { type: "ui_select", uiId, title: message, options });
+		} else if (valueProperty.type === "boolean") {
+			const result = await this.waitForUiPrompt(sessionId, {
+				type: "ui_confirm",
+				uiId,
+				title: message,
+				message: typeof valueProperty.description === "string" ? valueProperty.description : "",
+			});
+			if (result === undefined) return { action: "cancel" };
+			return { action: "accept", content: { value: result === "true" } };
+		} else {
+			value = await this.waitForUiPrompt(sessionId, {
+				type: "ui_input",
+				uiId,
+				title: message,
+				placeholder: typeof valueProperty.description === "string"
+					? valueProperty.description
+					: typeof valueProperty.default === "string" ? valueProperty.default : undefined,
+			});
+		}
+
+		if (value === undefined) return { action: "cancel" };
+		if (valueProperty.type === "integer") {
+			const parsed = Number.parseInt(value, 10);
+			return Number.isFinite(parsed) ? { action: "accept", content: { value: parsed } } : { action: "cancel" };
+		}
+		if (valueProperty.type === "number") {
+			const parsed = Number(value);
+			return Number.isFinite(parsed) ? { action: "accept", content: { value: parsed } } : { action: "cancel" };
+		}
+		return { action: "accept", content: { value } };
+	}
+
 	private createWebUIContext(sessionId: string): any {
 		const self = this;
-		const waitForUiPrompt = (event: PendingUiPromptEvent): Promise<string | undefined> => {
-			const uiId = event.uiId;
-			return new Promise<string | undefined>((resolve) => {
-				let done = false;
-				const finish = (value: string | undefined) => {
-					if (done) return false;
-					done = true;
-					self.pendingUiPrompts.delete(uiId);
-					resolve(value);
-					return true;
-				};
-				const close = (reason: DialogCloseReason) => {
-					const closed = finish(undefined);
-					if (closed) self.sendToController(sessionId, { type: "ui_prompt_closed", uiId, reason });
-					return closed;
-				};
-				self.pendingUiPrompts.set(uiId, { resolve: finish, close, sessionId, event });
-				self.sendToController(sessionId, event);
-			});
-		};
 		return {
 			async select(title: string, options: string[]): Promise<string | undefined> {
 				const uiId = randomUUID();
 				const event: PendingUiPromptEvent = { type: "ui_select", uiId, title, options };
-				return waitForUiPrompt(event);
+				return self.waitForUiPrompt(sessionId, event);
 			},
 			async confirm(title: string, message: string): Promise<boolean> {
 				const uiId = randomUUID();
 				const event: PendingUiPromptEvent = { type: "ui_confirm", uiId, title, message };
-				const result = await waitForUiPrompt(event);
+				const result = await self.waitForUiPrompt(sessionId, event);
 				return result === "true";
 			},
 			async input(title: string, placeholder?: string): Promise<string | undefined> {
 				const uiId = randomUUID();
 				const event: PendingUiPromptEvent = { type: "ui_input", uiId, title, placeholder };
-				return waitForUiPrompt(event);
+				return self.waitForUiPrompt(sessionId, event);
 			},
 			notify(message: string, type?: "info" | "warning" | "error") {
 				self.broadcast(sessionId, { type: "ui_notify", message, level: type ?? "info" });
@@ -1291,7 +1636,7 @@ export class PiWebRuntime {
 			async editor(title: string, defaultValue?: string): Promise<string | undefined> {
 				const uiId = randomUUID();
 				const event: PendingUiPromptEvent = { type: "ui_input", uiId, title, placeholder: defaultValue };
-				return waitForUiPrompt(event);
+				return self.waitForUiPrompt(sessionId, event);
 			},
 			async custom(title: string, options: Array<{ label: string; value: unknown } | string>) {
 				// Fallback for clarify dialogs and other custom UIs — use the working select UI
@@ -1299,7 +1644,7 @@ export class PiWebRuntime {
 				const labels = options.map((o) => (typeof o === "string" ? o : o.label));
 				const selected = await this.select(title || "Choose", labels);
 				if (selected === undefined) return undefined;
-				// Map back to original option object (pi-subagents clarify expects the option, not just the value)
+					// Map back to the original option object for OMP custom UI callers that expect it.
 				const idx = labels.indexOf(selected);
 				return options[idx];
 			},
@@ -1316,9 +1661,38 @@ export class PiWebRuntime {
 		};
 	}
 
-	private authStorage = AuthStorage.create();
-	private modelRegistry = ModelRegistry.create(this.authStorage);
+	private authStoragePromise = AuthStorage.create();
+	private modelRegistryPromise = this.authStoragePromise.then((auth) => new ModelRegistry(auth));
+
+	private async getAuthStorage(): Promise<any> {
+		return this.authStoragePromise;
+	}
+
+	private async getModelRegistry(): Promise<any> {
+		return this.modelRegistryPromise;
+	}
+	private archiveStorePath = join(homedir(), ".pi", "agent", "pi-web", "archive.json");
+	private archivedSessionIds = new Set<string>();
 	private repoStorePath = join(homedir(), ".pi", "agent", "pi-web", "repos.json");
+
+	private async saveArchiveToDisk(): Promise<void> {
+		try {
+			await mkdir(dirname(this.archiveStorePath), { recursive: true });
+			await writeFile(this.archiveStorePath, JSON.stringify([...this.archivedSessionIds], null, 2), "utf8");
+		} catch (err) {
+			console.error("Failed to save archive list to disk:", err);
+		}
+	}
+
+	async archiveSession(sessionId: string, archived: boolean): Promise<{ archived: boolean }> {
+		if (archived) {
+			this.archivedSessionIds.add(sessionId);
+		} else {
+			this.archivedSessionIds.delete(sessionId);
+		}
+		await this.saveArchiveToDisk();
+		return { archived };
+	}
 
 	private async loadReposFromDisk(): Promise<string[]> {
 		try {
@@ -1434,6 +1808,10 @@ export class PiWebRuntime {
 			});
 		}
 
+		for (const summary of byId.values()) {
+			summary.archived = this.archivedSessionIds.has(summary.id);
+		}
+
 		const sessions = [...byId.values()]
 			.filter(s => s.isRunning || existsSync(s.cwd))  // hide sessions from non-existent dirs
 			.sort((a, b) => b.modified.localeCompare(a.modified));
@@ -1444,7 +1822,7 @@ export class PiWebRuntime {
 		// Use the session's model registry if available — it includes models
 		// registered by extensions via pi.registerProvider().
 		// Fall back to the standalone registry for the model picker before any session.
-		let registry = this.modelRegistry;
+		let registry = await this.getModelRegistry();
 		for (const runtime of this.runningById.values()) {
 			if (runtime.session.modelRegistry) {
 				registry = runtime.session.modelRegistry;
@@ -1453,10 +1831,11 @@ export class PiWebRuntime {
 		}
 
 		try {
-			this.authStorage.reload();
+			const auth = await this.getAuthStorage();
+			await auth.reload();
 		} catch {}
 		try {
-			registry.refresh();
+			await registry.refresh();
 		} catch {}
 
 		const available = registry.getAvailable();
@@ -1476,10 +1855,7 @@ export class PiWebRuntime {
 		if (!runtime) {
 			throw new Error("session_not_running");
 		}
-		const state = buildState(runtime.session, runtime.cwd, includeFullHistory, runtime.startAgent, messageLimit);
-		state.pendingAskIds = [...this.pendingAsks.entries()]
-			.filter(([, pending]) => pending.sessionId === sessionId)
-			.map(([askId]) => askId);
+		const state = buildRuntimeState(runtime, includeFullHistory, messageLimit);
 		state.pendingUiPromptIds = [...this.pendingUiPrompts.entries()]
 			.filter(([, pending]) => pending.sessionId === sessionId)
 			.map(([uiId]) => uiId);
@@ -1571,7 +1947,7 @@ export class PiWebRuntime {
 			sessionManager.newSession({ parentSession: currentSessionFile });
 			forkedSessionPath = sessionManager.getSessionFile();
 		} else {
-			const sourceManager = openSessionManagerFast(currentSessionFile, sessionDir);
+			const sourceManager = await openSessionManagerFast(currentSessionFile, sessionDir);
 			forkedSessionPath = sourceManager.createBranchedSession(selectedEntry.parentId);
 		}
 
@@ -1620,6 +1996,18 @@ export class PiWebRuntime {
 		return runtime.terminalManager.addClient(client);
 	}
 
+	addGlobalTerminalClient(client: TerminalClient): ApiTerminalServerMessage {
+		return this.globalTerminalManager.addClient(client);
+	}
+
+	removeGlobalTerminalClient(connectionId: string): void {
+		this.globalTerminalManager.removeClient(connectionId);
+	}
+
+	handleGlobalTerminalClientMessage(connectionId: string, message: ApiTerminalClientMessage): void {
+		this.globalTerminalManager.handleMessage(connectionId, message);
+	}
+
 	removeTerminalClient(sessionId: string, connectionId: string): void {
 		const runtime = this.runningById.get(sessionId);
 		if (!runtime) return;
@@ -1653,18 +2041,18 @@ export class PiWebRuntime {
 				throw new Error(`session file does not exist: ${path}`);
 			}
 
-			const sessionManager = openSessionManagerFast(path);
+			const sessionManager = await openSessionManagerFast(path);
 			const cwd = sessionManager.getCwd();
-			const { session, startAgentConfig } = await createSessionWithWorktreeGuard({
+			const { session, startAgentConfig, setToolUIContext } = await createSessionWithWorktreeGuard({
 				cwd,
 				sessionManager,
-				authStorage: this.authStorage,
-				modelRegistry: this.modelRegistry,
+				authStorage: await this.getAuthStorage(),
+				modelRegistry: await this.getModelRegistry(),
 				startAgent: request.startAgent,
 			});
-			const runtime = this.registerSession(session, cwd, clientId, startAgentConfig);
-			await session.bindExtensions({ uiContext: this.createWebUIContext(runtime.session.sessionId) });
-			this.wrapAskTool(session, runtime.session.sessionId);
+			const acp = await this.createAcpBridge(session, cwd, request.startAgent);
+			const runtime = this.registerSession(session, cwd, clientId, startAgentConfig, acp);
+			this.bindSessionUi(session, setToolUIContext);
 			return { sessionId: runtime.session.sessionId };
 		}
 
@@ -1685,16 +2073,16 @@ export class PiWebRuntime {
 		}
 
 		const sessionManager = SessionManager.create(cwd);
-		const { session, startAgentConfig } = await createSessionWithWorktreeGuard({
+		const { session, startAgentConfig, setToolUIContext } = await createSessionWithWorktreeGuard({
 			cwd,
 			sessionManager,
-			authStorage: this.authStorage,
-			modelRegistry: this.modelRegistry,
+			authStorage: await this.getAuthStorage(),
+			modelRegistry: await this.getModelRegistry(),
 			startAgent: request.startAgent,
 		});
-		const runtime = this.registerSession(session, cwd, clientId, startAgentConfig);
-		await session.bindExtensions({ uiContext: this.createWebUIContext(runtime.session.sessionId) });
-		this.wrapAskTool(session, runtime.session.sessionId);
+		const acp = await this.createAcpBridge(session, cwd, request.startAgent);
+		const runtime = this.registerSession(session, cwd, clientId, startAgentConfig, acp);
+		this.bindSessionUi(session, setToolUIContext);
 		return { sessionId: runtime.session.sessionId };
 	}
 
@@ -1706,18 +2094,7 @@ export class PiWebRuntime {
 
 		if (command.type === "abort") {
 			this.cancelPendingDialogsForSession(sessionId, "aborted");
-			await runtime.session.abort();
-			return;
-		}
-
-		if (command.type === "ask_response") {
-			this.assertController(runtime, command.clientId);
-			const askId = typeof command.askId === "string" ? command.askId.trim() : "";
-			if (!askId) throw new Error("missing_ask_id");
-			const selections = Array.isArray(command.selections) ? command.selections : [];
-			if (!this.resolveAsk(sessionId, askId, Boolean(command.cancelled), selections)) {
-				throw new Error("ask_not_pending");
-			}
+			await runtime.acp.client.cancel({ sessionId });
 			return;
 		}
 
@@ -1738,7 +2115,7 @@ export class PiWebRuntime {
 					? command.customInstructions.trim()
 					: undefined;
 			await runtime.session.compact(customInstructions);
-			this.broadcast(sessionId, { type: "state_patch", patch: buildPatch(runtime.session) });
+			this.broadcast(sessionId, { type: "state_patch", patch: buildRuntimePatch(runtime) });
 			return;
 		}
 
@@ -1751,7 +2128,7 @@ export class PiWebRuntime {
 			await runtime.session.executeBash(bashCommand, undefined, {
 				excludeFromContext: Boolean(command.excludeFromContext),
 			});
-			this.broadcast(sessionId, { type: "state_patch", patch: buildPatch(runtime.session) });
+			this.broadcast(sessionId, { type: "state_patch", patch: buildRuntimePatch(runtime) });
 			return;
 		}
 
@@ -1781,35 +2158,30 @@ export class PiWebRuntime {
 			}
 			if (text.length === 0 && images.length === 0) return;
 
-			// Intercept TUI-only built-in commands that would fall through to the LLM
-			const TUI_ONLY_COMMANDS = new Set(["model", "login", "logout", "new", "resume", "tree", "fork", "name", "session", "share", "export", "import", "copy", "debug", "reload", "hotkeys", "changelog"]);
-			const cmdMatch = text.match(/^\/([a-zA-Z_-]+)/);
-			if (cmdMatch && TUI_ONLY_COMMANDS.has(cmdMatch[1].toLowerCase())) {
-				// Check if it's actually a registered extension command (takes priority)
-				const runner = (runtime.session as any)._extensionRunner;
-				const commandName = cmdMatch[1].toLowerCase();
-				const isExtCmd = runner && typeof runner.getCommand === "function" && runner.getCommand(commandName);
-				if (!isExtCmd) {
-					const message = commandName === "tree" || commandName === "fork"
-						? `/${commandName} is available in pi-mobile via the Commands menu.`
-						: `/${cmdMatch[1]} is not available in pi-mobile. Use the UI controls instead.`;
-					this.broadcast(sessionId, { type: "ui_notify", message, level: "warning" });
-					return;
+			if (isSessionCustomSlashCommand(runtime.session, text)) {
+				const promptOptions = images.length > 0 ? { images } : undefined;
+				const wasStreaming = runtime.session.isStreaming;
+				await runtime.session.prompt(
+					text,
+					wasStreaming
+						? { ...(promptOptions ?? {}), streamingBehavior: command.deliverAs ?? "steer" }
+						: promptOptions,
+				);
+				if (!runtime.session.isStreaming) {
+					this.broadcast(runtime.session.sessionId, { type: "state_patch", patch: buildRuntimePatch(runtime) });
 				}
+				return;
 			}
 
-			const promptOptions = images.length > 0 ? { images } : undefined;
-			const wasStreaming = runtime.session.isStreaming;
-			await runtime.session.prompt(
-				text,
-				wasStreaming
-					? { ...(promptOptions ?? {}), streamingBehavior: command.deliverAs ?? "steer" }
-					: promptOptions,
-			);
+			const prompt = [
+				...(text.length > 0 ? [{ type: "text" as const, text }] : []),
+				...images,
+			];
+			await runtime.acp.client.prompt({ sessionId, prompt, messageId: randomUUID() } as any);
 			// If prompt returned without starting an agent run (e.g. extension
 			// commands), broadcast a state patch so the frontend can update.
 			if (!runtime.session.isStreaming) {
-				this.broadcast(runtime.session.sessionId, { type: "state_patch", patch: buildPatch(runtime.session) });
+				this.broadcast(runtime.session.sessionId, { type: "state_patch", patch: buildRuntimePatch(runtime) });
 			}
 			return;
 		}
@@ -1820,16 +2192,12 @@ export class PiWebRuntime {
 			const modelId = command.modelId.trim();
 			if (!provider || !modelId) throw new Error("invalid_model");
 
-			// Use the session's registry — it has extension-registered providers
-			const registry = runtime.session.modelRegistry ?? this.modelRegistry;
-			try { this.authStorage.reload(); } catch {}
-			try { registry.refresh(); } catch {}
-
-			const available = registry.getAvailable();
-			const model = available.find((m) => m.provider === provider && m.id === modelId);
-			if (!model) throw new Error(`model_not_available: ${provider}/${modelId}`);
-			await runtime.session.setModel(model);
-			this.broadcast(sessionId, { type: "state_patch", patch: buildPatch(runtime.session) });
+			await runtime.acp.client.unstable_setSessionModel({ sessionId, modelId: `${provider}/${modelId}` });
+			runtime.acp.state.models = {
+				availableModels: runtime.acp.state.models?.availableModels ?? [],
+				currentModelId: `${provider}/${modelId}`,
+			};
+			this.broadcast(sessionId, { type: "state_patch", patch: buildRuntimePatch(runtime) });
 			return;
 		}
 
@@ -1839,7 +2207,7 @@ export class PiWebRuntime {
 			const allowed = ["off", "minimal", "low", "medium", "high", "xhigh"];
 			if (!allowed.includes(level)) throw new Error(`invalid_thinking_level: ${level}`);
 			runtime.session.setThinkingLevel(level as ThinkingLevel);
-			this.broadcast(sessionId, { type: "state_patch", patch: buildPatch(runtime.session) });
+			this.broadcast(sessionId, { type: "state_patch", patch: buildRuntimePatch(runtime) });
 			return;
 		}
 
@@ -1848,7 +2216,7 @@ export class PiWebRuntime {
 			const mode = command.mode;
 			if (mode !== "all" && mode !== "one-at-a-time") throw new Error(`invalid_steering_mode: ${String(mode)}`);
 			runtime.session.setSteeringMode(mode);
-			this.broadcast(sessionId, { type: "state_patch", patch: buildPatch(runtime.session) });
+			this.broadcast(sessionId, { type: "state_patch", patch: buildRuntimePatch(runtime) });
 			return;
 		}
 
@@ -1857,7 +2225,7 @@ export class PiWebRuntime {
 			const mode = command.mode;
 			if (mode !== "all" && mode !== "one-at-a-time") throw new Error(`invalid_follow_up_mode: ${String(mode)}`);
 			runtime.session.setFollowUpMode(mode);
-			this.broadcast(sessionId, { type: "state_patch", patch: buildPatch(runtime.session) });
+			this.broadcast(sessionId, { type: "state_patch", patch: buildRuntimePatch(runtime) });
 			return;
 		}
 
@@ -1866,7 +2234,7 @@ export class PiWebRuntime {
 			const name = command.name.trim();
 			if (!name) throw new Error("invalid_session_name");
 			runtime.session.setSessionName(name);
-			this.broadcast(sessionId, { type: "state_patch", patch: buildPatch(runtime.session) });
+			this.broadcast(sessionId, { type: "state_patch", patch: buildRuntimePatch(runtime) });
 			return;
 		}
 
@@ -1899,7 +2267,7 @@ export class PiWebRuntime {
 		runtime.terminalManager.dispose();
 
 		try {
-			await runtime.session.abort();
+			await runtime.acp.client.cancel({ sessionId });
 		} catch {
 			// best effort
 		}
@@ -1927,7 +2295,7 @@ export class PiWebRuntime {
 		}
 		runtime.terminalManager.dispose();
 
-		try { await runtime.session.abort(); } catch {}
+		try { await runtime.acp.client.cancel({ sessionId }); } catch {}
 		try { runtime.session.dispose(); } catch {}
 
 		this.runningById.delete(sessionId);
@@ -1952,7 +2320,7 @@ export class PiWebRuntime {
 		}
 	}
 
-	private registerSession(session: AgentSession, cwd: string, controllerClientId: string, startAgentConfig: ResolvedStartAgentConfig | null): RunningSession {
+	private registerSession(session: AgentSession, cwd: string, controllerClientId: string, startAgentConfig: ResolvedStartAgentConfig | null, acp: AcpRuntimeBridge): RunningSession {
 		const sessionId = session.sessionId;
 		const sessionFile = session.sessionFile ?? null;
 
@@ -1980,6 +2348,7 @@ export class PiWebRuntime {
 			unsubscribe: null,
 			lastAssistantMessageText: "",
 			startAgent: startAgentConfig?.name,
+			acp,
 		};
 
 		const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
@@ -2012,7 +2381,7 @@ export class PiWebRuntime {
 			}
 
 			if (event.type === "agent_end" || event.type === "compaction_end") {
-				this.broadcast(sessionId, { type: "state_patch", patch: buildPatch(session) });
+				this.broadcast(sessionId, { type: "state_patch", patch: buildRuntimePatch(runtime) });
 			}
 		});
 		runtime.unsubscribe = unsubscribe;

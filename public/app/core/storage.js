@@ -104,12 +104,12 @@ export function setVoiceInputMode(mode) {
 export function getVoiceTranscriptionMode() {
 	const stored = safeLocalStorageGet("piWebVoiceTranscriptionMode");
 	if (stored === "web-speech") return "web-speech";
-	if (stored === "parakeet") return "parakeet";
-	return "parakeet"; // default
+	if (stored === "chatgpt" || stored === "parakeet") return "chatgpt";
+	return "chatgpt"; // default
 }
 
 export function setVoiceTranscriptionMode(mode) {
-	safeLocalStorageSet("piWebVoiceTranscriptionMode", mode === "web-speech" ? "web-speech" : "parakeet");
+	safeLocalStorageSet("piWebVoiceTranscriptionMode", mode === "web-speech" ? "web-speech" : "chatgpt");
 }
 
 export function getLastVoiceTranscript(sessionId = null) {

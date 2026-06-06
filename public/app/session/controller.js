@@ -11,8 +11,6 @@ export function createSessionController({
 	onCloseMenu,
 	onSidebarClose,
 	onSidebarRefresh,
-	onAskRequest,
-	onAskClosed,
 	onUiSelect,
 	onUiInput,
 	onUiConfirm,
@@ -383,22 +381,6 @@ export function createSessionController({
 			return;
 		}
 
-		if (event.type === "ask_request") {
-			if (controllerClientId !== clientId) return;
-			if (typeof onAskRequest === "function" && activeSessionId) {
-				onAskRequest(activeSessionId, event.askId, event.questions);
-			}
-			return;
-		}
-
-		if (event.type === "ask_closed") {
-			if (controllerClientId !== clientId) return;
-			if (typeof onAskClosed === "function" && activeSessionId) {
-				onAskClosed(activeSessionId, event.askId, event.reason);
-			}
-			return;
-		}
-
 		if (event.type === "ui_select") {
 			if (controllerClientId !== clientId) return;
 			if (typeof onUiSelect === "function") {
@@ -603,33 +585,6 @@ export function createSessionController({
 	function isSessionGoneError(error) {
 		const msg = error instanceof Error ? error.message : String(error);
 		return msg.includes("session_not_running") || msg.includes("Session not running") || msg.includes("not_running");
-	}
-
-	async function sendAskResponse(askId, cancelled, selections) {
-		if (!activeSessionId) return;
-		try {
-			await api.postJson(`/api/sessions/${encodeURIComponent(activeSessionId)}/command`, {
-				type: "ask_response",
-				clientId,
-				askId,
-				cancelled,
-				selections,
-			});
-		} catch (error) {
-			const msg = error instanceof Error ? error.message : String(error);
-			if (msg.includes("Not controller") || msg.includes("not_controller")) {
-				await refreshState({ silent: true, syncMessages: false });
-				chatView.appendNotice("This question moved to another client.", "warning");
-				return;
-			}
-			if (msg.includes("ask_not_pending")) {
-				await refreshState({ silent: true, syncMessages: false });
-				chatView.appendNotice("That question is no longer pending.", "warning");
-				return;
-			}
-			if (isSessionGoneError(error)) { handleSessionLost(); return; }
-			chatView.appendNotice(msg, "error");
-		}
 	}
 
 	async function sendUiResponse(uiId, cancelled, value) {
@@ -1081,7 +1036,6 @@ export function createSessionController({
 		selectSession,
 		sendPrompt,
 		sendPromptToSession,
-		sendAskResponse,
 		sendUiResponse,
 		setSteeringMode,
 		setFollowUpMode,

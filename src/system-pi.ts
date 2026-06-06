@@ -3,8 +3,8 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-// pi-mobile intentionally loads Pi from the global npm install so the web UI
-// stays aligned with the user's system `pi` CLI version.
+// pi-mobile intentionally loads OMP from the installed package so the web UI
+// stays aligned with the user's system `omp` CLI version.
 let cachedNpmRoot: string | null | undefined;
 let cachedPiModule: Promise<Record<string, any>> | null = null;
 
@@ -20,20 +20,22 @@ export function getGlobalNpmRoot(): string | null {
 }
 
 export function getSystemPiEntryPath(): string {
-	const npmRoot = getGlobalNpmRoot();
-	if (!npmRoot) {
-		throw new Error(
-			"Unable to resolve npm global root. pi-mobile requires a system pi install (npm install -g @mariozechner/pi-coding-agent).",
-		);
+	try {
+		return Bun.resolveSync("@oh-my-pi/pi-coding-agent", process.cwd());
+	} catch (err) {
+		try {
+			return require.resolve("@oh-my-pi/pi-coding-agent");
+		} catch (err2) {
+			const npmRoot = getGlobalNpmRoot();
+			if (npmRoot) {
+				const entryPath = join(npmRoot, "@oh-my-pi", "pi-coding-agent", "src", "index.ts");
+				if (existsSync(entryPath)) return entryPath;
+			}
+			throw new Error(
+				"Unable to resolve @oh-my-pi/pi-coding-agent. Install it locally or globally: bun add @oh-my-pi/pi-coding-agent",
+			);
+		}
 	}
-
-	const entryPath = join(npmRoot, "@mariozechner", "pi-coding-agent", "dist", "index.js");
-	if (!existsSync(entryPath)) {
-		throw new Error(
-			`System pi module not found at ${entryPath}. Install or update it with: npm install -g @mariozechner/pi-coding-agent`,
-		);
-	}
-	return entryPath;
 }
 
 export async function loadSystemPiModule(): Promise<Record<string, any>> {
@@ -43,7 +45,7 @@ export async function loadSystemPiModule(): Promise<Record<string, any>> {
 	cachedPiModule = import(pathToFileURL(entryPath).href).catch((error: unknown) => {
 		cachedPiModule = null;
 		const reason = error instanceof Error ? error.message : String(error);
-		throw new Error(`Failed to load system pi from ${entryPath}: ${reason}`);
+		throw new Error(`Failed to load OMP from ${entryPath}: ${reason}`);
 	});
 	return cachedPiModule;
 }

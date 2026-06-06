@@ -134,7 +134,7 @@ require_npm() {
     return 0
   fi
 
-  err "npm is required because pi-mobile loads Pi from the global npm install"
+  err "npm is required because pi-mobile can load OMP from the global npm install"
   err "Install Node.js/npm, then rerun ./setup.sh"
   exit 1
 }
@@ -177,7 +177,7 @@ ensure_global_npm_package() {
   fi
 }
 
-# ── 2. Check npm + global Pi packages ─────────────────────────────
+# ── 2. Check npm + global OMP package ─────────────────────────────
 require_npm
 NPM_GLOBAL_ROOT="$(resolve_npm_global_root)"
 if [[ -z "$NPM_GLOBAL_ROOT" ]]; then
@@ -186,12 +186,8 @@ if [[ -z "$NPM_GLOBAL_ROOT" ]]; then
 fi
 ok "npm global root: $NPM_GLOBAL_ROOT"
 
-ensure_global_npm_package pi @mariozechner/pi-coding-agent "@mariozechner/pi-coding-agent"
-ensure_global_npm_package pi-subagents pi-subagents "pi-subagents"
-ensure_global_npm_package "" pi-ask-tool-extension "pi-ask-tool-extension"
+ensure_global_npm_package omp @oh-my-pi/pi-coding-agent "@oh-my-pi/pi-coding-agent"
 ensure_fuzzy_search_tools || true
-
-ASK_EXT_ROOT="$NPM_GLOBAL_ROOT"
 
 # ── 3. Install deps ──────────────────────────────────────────────
 info "Installing dependencies..."
@@ -201,21 +197,6 @@ ok "Dependencies installed"
 
 # ── 4. Create ~/.bin ──────────────────────────────────────────────
 mkdir -p "$BIN_DIR"
-
-# ── 5. Install custom /review Pi extension ───────────────────────
-REVIEW_EXT_SRC="$SCRIPT_DIR/pi-extension/review.ts"
-REVIEW_EXT_DST="$HOME/.pi/agent/extensions/review.ts"
-mkdir -p "$(dirname "$REVIEW_EXT_DST")"
-if [[ -f "$REVIEW_EXT_SRC" ]]; then
-  sed \
-    -e "s|__PI_ASK_EXT_ROOT__|$ASK_EXT_ROOT|g" \
-    -e "s|from \"pi-ask-tool-extension/src/ask-inline-ui.ts\"|from \"$ASK_EXT_ROOT/pi-ask-tool-extension/src/ask-inline-ui.ts\"|g" \
-    -e "s|from \"pi-ask-tool-extension/src/ask-tabs-ui.ts\"|from \"$ASK_EXT_ROOT/pi-ask-tool-extension/src/ask-tabs-ui.ts\"|g" \
-    "$REVIEW_EXT_SRC" > "$REVIEW_EXT_DST"
-  ok "Installed custom /review extension → $REVIEW_EXT_DST"
-else
-  warn "Custom /review extension source not found at $REVIEW_EXT_SRC"
-fi
 
 # ── 6. Create pi-mobile launcher ─────────────────────────────────
 cat > "$BIN_DIR/pi-mobile" << 'LAUNCHER'

@@ -91,6 +91,9 @@ export function createSidebar({
 	let lastRenderedSessions = [];
 	let lastFetchedSessions = [];
 	let sessionSearchQuery = "";
+	let showArchivedSessions = false;
+	const collapsedSessionGroups = new Set();
+	const expandedExtraGroups = new Set();
 	let consecutiveRefreshFailures = 0;
 	const sessionsNeedingAttention = new Set(); // sessionIds with pending asks/notifications
 	const previouslyStreaming = new Set(); // sessionIds that were streaming last poll
@@ -269,7 +272,7 @@ export function createSidebar({
 
 		const meta = document.createElement("div");
 		meta.className = "si-meta";
-		meta.textContent = rel;
+		meta.textContent = s.archived ? `${rel} • archived` : rel;
 		if (s.isRunning) {
 			const running = document.createElement("span");
 			running.className = "si-run";
@@ -295,9 +298,14 @@ export function createSidebar({
 		moreBtn.addEventListener("click", (e) => { e.stopPropagation(); showSessionActions(s, row); });
 		row.appendChild(moreBtn);
 
-		row.addEventListener("click", () => {
+		row.addEventListener("click", async () => {
 			highlightSessionRow(s.id);
-			void onSelectSession(s);
+			try {
+				await onSelectSession(s);
+			} catch (err) {
+				onNotice(err instanceof Error ? err.message : String(err), "error");
+				highlightSessionRow(null);
+			}
 			if (window.matchMedia("(hover: none) and (pointer: coarse) and (max-width: 1024px)").matches) {
 				setOpen(false);
 			}
@@ -316,6 +324,149 @@ export function createSidebar({
 		return row;
 	}
 
+	function sessionRowRenderKey(s) {
+		return [
+			s?.id || "",
+			s?.name || "",
+			s?.firstMessage || "",
+			s?.cwd || "",
+			s?.modified || "",
+			s?.archived ? "1" : "0",
+			s?.isRunning ? "1" : "0",
+			s?.startAgent || "",
+			s?.id === getActiveSessionId() ? "1" : "0",
+			sessionsNeedingAttention.has(s?.id) ? "1" : "0",
+		].join("\u001f");
+	}
+
+	function captureExpandedSessionRows() {
+		const expanded = new Set();
+		sessionsList.querySelectorAll("[data-session-id]").forEach((row) => {
+			if (row.getAttribute("aria-expanded") === "true" || row.classList.contains("expanded")) {
+				expanded.add(row.dataset.sessionId);
+			}
+		});
+		return expanded;
+	}
+
+	function restoreExpandedSessionRow(row, expandedSessionIds) {
+		if (!row?.dataset?.sessionId || !expandedSessionIds.has(row.dataset.sessionId)) return;
+		row.classList.add("expanded");
+		row.setAttribute("aria-expanded", "true");
+	}
+
+	function makeReusableSessionRowRenderer(existingRowsById, expandedSessionIds) {
+		return (session) => {
+			const key = sessionRowRenderKey(session);
+			const existing = existingRowsById.get(session.id);
+			if (existing?.dataset?.renderKey === key) {
+				restoreExpandedSessionRow(existing, expandedSessionIds);
+				return existing;
+			}
+			const row = renderSessionRow(session);
+			row.dataset.renderKey = key;
+			restoreExpandedSessionRow(row, expandedSessionIds);
+			return row;
+		};
+	}
+
+	function reconcileSessionList(nextChildren) {
+		let index = 0;
+		for (const child of nextChildren) {
+			const current = sessionsList.children[index];
+			if (current !== child) sessionsList.insertBefore(child, current || null);
+			index += 1;
+		}
+		while (sessionsList.children.length > index) {
+			sessionsList.removeChild(sessionsList.lastElementChild);
+		}
+	}
+
+
+	function sessionModifiedTime(session) {
+		const time = Date.parse(session?.modified);
+		return Number.isFinite(time) ? time : 0;
+	}
+
+	function sortSessionsByModifiedDesc(sessions) {
+		sessions.sort((a, b) => sessionModifiedTime(b) - sessionModifiedTime(a));
+		return sessions;
+	}
+
+	function latestGroupModified(sessions) {
+		let latest = 0;
+		for (const session of sessions) latest = Math.max(latest, sessionModifiedTime(session));
+		return latest;
+	}
+
+	function sortGroupKeysByLatest(groups) {
+		return [...groups.keys()].sort((a, b) => {
+			const modifiedDelta = latestGroupModified(groups.get(b)) - latestGroupModified(groups.get(a));
+			return modifiedDelta || shortPath(a).localeCompare(shortPath(b));
+		});
+	}
+
+	function appendSessionGroup({ key, label, sessions, addTitle, onAdd, container = sessionsList, renderRow = renderSessionRow }) {
+		const collapsed = collapsedSessionGroups.has(key);
+		const hdrWrap = document.createElement("div");
+		hdrWrap.className = `sidebar-group-hdr-wrap${collapsed ? " collapsed" : ""}`;
+		const hdr = document.createElement("button");
+		hdr.className = "sidebar-group-hdr";
+		hdr.style.cssText = "background:transparent;border:0;text-align:left;font:inherit;cursor:pointer;";
+		hdr.type = "button";
+		hdr.textContent = `${collapsed ? "▸" : "▾"} ${label}`;
+		hdr.title = label;
+		hdr.setAttribute("aria-expanded", collapsed ? "false" : "true");
+		hdr.addEventListener("click", () => {
+			if (collapsedSessionGroups.has(key)) collapsedSessionGroups.delete(key);
+			else collapsedSessionGroups.add(key);
+			renderSessionList(lastFetchedSessions);
+		});
+		hdrWrap.appendChild(hdr);
+		const addBtn = document.createElement("button");
+		addBtn.className = "sidebar-group-add";
+		addBtn.textContent = "+";
+		addBtn.title = addTitle;
+		addBtn.addEventListener("click", (e) => {
+			e.stopPropagation();
+			onAdd();
+		});
+		hdrWrap.appendChild(addBtn);
+		container.appendChild(hdrWrap);
+		if (!collapsed) {
+			const sorted = sortSessionsByModifiedDesc(sessions);
+			const limit = 5;
+			const showAll = expandedExtraGroups.has(key);
+			const visibleSessions = showAll ? sorted : sorted.slice(0, limit);
+
+			for (const session of visibleSessions) {
+				container.appendChild(renderRow(session));
+			}
+
+			if (sorted.length > limit) {
+				const expandRow = document.createElement("div");
+				expandRow.className = "si-expand-row";
+				const expandBtn = document.createElement("button");
+				expandBtn.className = "si-expand-btn";
+				const remaining = sorted.length - limit;
+				expandBtn.textContent = showAll
+					? `▴ Show less`
+					: `▾ Show ${remaining} more session${remaining > 1 ? "s" : ""}`;
+				expandBtn.addEventListener("click", (e) => {
+					e.stopPropagation();
+					if (expandedExtraGroups.has(key)) {
+						expandedExtraGroups.delete(key);
+					} else {
+						expandedExtraGroups.add(key);
+					}
+					renderSessionList(lastFetchedSessions);
+				});
+				expandRow.appendChild(expandBtn);
+				container.appendChild(expandRow);
+			}
+		}
+	}
+
 	let activeSheetDismiss = null;
 	function showSessionActions(s, row) {
 		const isWt = isWorktreePath(s.cwd);
@@ -331,6 +482,14 @@ export function createSidebar({
 			return b;
 		};
 		sheet.appendChild(makeBtn("Rename", () => void renameSessionRow(s)));
+		sheet.appendChild(makeBtn(s.archived ? "Unarchive" : "Archive", async () => {
+			try {
+				await api.postJson(`/api/sessions/${encodeURIComponent(s.id)}/archive`, { archived: !s.archived });
+				void refresh({ force: true });
+			} catch (err) {
+				onNotice(err instanceof Error ? err.message : String(err), "error");
+			}
+		}));
 		if (isWt) {
 			sheet.appendChild(makeBtn("Merge", async () => {
 				if (!window.confirm(`Merge "worktree-${wtName}" into current branch?`)) return;
@@ -359,17 +518,27 @@ export function createSidebar({
 	}
 
 	function renderSessionList(sessions) {
+		const scrollTop = sessionsList.scrollTop;
+		const expandedSessionIds = captureExpandedSessionRows();
+		const existingRowsById = new Map();
+		sessionsList.querySelectorAll("[data-session-id]").forEach((row) => {
+			if (row.dataset.sessionId) existingRowsById.set(row.dataset.sessionId, row);
+		});
+		const renderRow = makeReusableSessionRowRenderer(existingRowsById, expandedSessionIds);
+		const nextChildren = [];
+		const nextList = { appendChild: (child) => { nextChildren.push(child); return child; } };
+
 		lastFetchedSessions = Array.isArray(sessions) ? sessions.slice() : [];
 		const query = sessionSearchQuery.trim().toLowerCase();
-		const allFiltered = query
+		const allFiltered = (query
 			? lastFetchedSessions.filter((s) => fuzzyMatchSession(query, buildSessionSearchHaystack(s, query)))
-			: lastFetchedSessions.slice();
+			: lastFetchedSessions.slice())
+			.filter((s) => showArchivedSessions || !s.archived);
 
 		const normalSessions = allFiltered.filter((s) => !isWorktreePath(s.cwd));
 		const worktreeSessions = allFiltered.filter((s) => isWorktreePath(s.cwd));
 		lastRenderedSessions = allFiltered.slice();
 		consecutiveRefreshFailures = 0;
-		sessionsList.innerHTML = "";
 
 		// Keep the primary CTA focused on starting a session.
 		const newRow = document.createElement("div");
@@ -379,7 +548,7 @@ export function createSidebar({
 		newBtn.textContent = "＋ Session";
 		newBtn.addEventListener("click", () => void showNewSessionPicker());
 		newRow.appendChild(newBtn);
-		sessionsList.appendChild(newRow);
+		nextList.appendChild(newRow);
 
 		const searchWrap = document.createElement("div");
 		searchWrap.className = "sessions-search-wrap";
@@ -402,13 +571,28 @@ export function createSidebar({
 			});
 		});
 		searchWrap.appendChild(searchInput);
-		sessionsList.appendChild(searchWrap);
+		nextList.appendChild(searchWrap);
+
+		const archiveWrap = document.createElement("label");
+		archiveWrap.className = "sessions-archive-toggle";
+		const archiveToggle = document.createElement("input");
+		archiveToggle.type = "checkbox";
+		archiveToggle.checked = showArchivedSessions;
+		archiveToggle.addEventListener("change", () => {
+			showArchivedSessions = archiveToggle.checked;
+			renderSessionList(lastFetchedSessions);
+		});
+		archiveWrap.appendChild(archiveToggle);
+		archiveWrap.appendChild(document.createTextNode(" Show archived sessions"));
+		nextList.appendChild(archiveWrap);
 
 		if (normalSessions.length === 0 && worktreeSessions.length === 0) {
 			const empty = document.createElement("div");
 			empty.className = "si";
-			empty.innerHTML = `<div class="si-meta" style="padding:12px 0">${query ? "No matching sessions" : "No sessions yet"}</div>`;
-			sessionsList.appendChild(empty);
+			empty.innerHTML = `<div class="si-meta" style="padding:12px 0">${query ? "No matching sessions" : (showArchivedSessions ? "No sessions yet" : "No active sessions")}</div>`;
+			nextList.appendChild(empty);
+			reconcileSessionList(nextChildren);
+			sessionsList.scrollTop = scrollTop;
 			return;
 		}
 
@@ -421,26 +605,17 @@ export function createSidebar({
 				byDir.get(dir).push(s);
 			}
 
-			const sortedDirs = [...byDir.keys()].sort((a, b) => shortPath(a).localeCompare(shortPath(b)));
+			const sortedDirs = sortGroupKeysByLatest(byDir);
 			for (const dir of sortedDirs) {
-				const sessions = byDir.get(dir);
-				const hdrWrap = document.createElement("div");
-				hdrWrap.className = "sidebar-group-hdr-wrap";
-				const hdr = document.createElement("div");
-				hdr.className = "sidebar-group-hdr";
-				hdr.textContent = shortPath(dir);
-				hdrWrap.appendChild(hdr);
-				const addBtn = document.createElement("button");
-				addBtn.className = "sidebar-group-add";
-				addBtn.textContent = "+";
-				addBtn.title = "New session in this folder";
-				addBtn.addEventListener("click", (e) => {
-					e.stopPropagation();
-					void showNewSessionInFolder(dir);
+				appendSessionGroup({
+					key: `cwd:${dir}`,
+					label: shortPath(dir),
+					sessions: byDir.get(dir),
+					addTitle: "New session in this folder",
+					onAdd: () => void showNewSessionInFolder(dir),
+					container: nextList,
+					renderRow,
 				});
-				hdrWrap.appendChild(addBtn);
-				sessionsList.appendChild(hdrWrap);
-				for (const s of sessions) sessionsList.appendChild(renderSessionRow(s));
 			}
 		}
 
@@ -449,7 +624,7 @@ export function createSidebar({
 			const sectionHdr = document.createElement("div");
 			sectionHdr.className = "sidebar-section-hdr";
 			sectionHdr.textContent = "Worktrees";
-			sessionsList.appendChild(sectionHdr);
+			nextList.appendChild(sectionHdr);
 
 			const byRepo = new Map();
 			for (const s of worktreeSessions) {
@@ -459,30 +634,22 @@ export function createSidebar({
 				byRepo.get(repoRoot).push(s);
 			}
 
-			const sortedRepos = [...byRepo.keys()].sort((a, b) => shortPath(a).localeCompare(shortPath(b)));
+			const sortedRepos = sortGroupKeysByLatest(byRepo);
 			for (const repoRoot of sortedRepos) {
-				const sessions = byRepo.get(repoRoot);
-				const hdrWrap = document.createElement("div");
-				hdrWrap.className = "sidebar-group-hdr-wrap";
-				const hdr = document.createElement("div");
-				hdr.className = "sidebar-group-hdr";
-				hdr.textContent = shortPath(repoRoot);
-				hdrWrap.appendChild(hdr);
-				const addBtn = document.createElement("button");
-				addBtn.className = "sidebar-group-add";
-				addBtn.textContent = "+";
-				addBtn.title = "New worktree session";
-				addBtn.addEventListener("click", (e) => {
-					e.stopPropagation();
-					void showWorktreeForm(repoRoot);
+				appendSessionGroup({
+					key: `worktree:${repoRoot}`,
+					label: shortPath(repoRoot),
+					sessions: byRepo.get(repoRoot),
+					addTitle: "New worktree session",
+					onAdd: () => void showWorktreeForm(repoRoot),
+					container: nextList,
+					renderRow,
 				});
-				hdrWrap.appendChild(addBtn);
-				sessionsList.appendChild(hdrWrap);
-				for (const s of sessions) sessionsList.appendChild(renderSessionRow(s));
 			}
 		}
 
-
+		reconcileSessionList(nextChildren);
+		sessionsList.scrollTop = scrollTop;
 	}
 	function restoreSessionsView() {
 		viewMode = "sessions";
@@ -1049,7 +1216,7 @@ export function createSidebar({
 
 			merged.sort((a, b) => Date.parse(b.modified) - Date.parse(a.modified));
 
-			renderSessionList(merged.slice(0, 50));
+			renderSessionList(merged);
 		} catch (error) {
 			consecutiveRefreshFailures += 1;
 			if (lastRenderedSessions.length > 0 && consecutiveRefreshFailures < 3) {
@@ -1071,7 +1238,7 @@ export function createSidebar({
 
 	// Poll for session state changes (streaming → done) every 5s
 	attentionPollTimer = setInterval(() => {
-		if (viewMode !== "sessions") return;
+		if (document.hidden || viewMode !== "sessions") return;
 		void refresh();
 	}, 5_000);
 

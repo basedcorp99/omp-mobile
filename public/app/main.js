@@ -29,10 +29,7 @@ import {
 import { createSessionController } from "./session/controller.js";
 import { extractTextContent } from "./session/content.js";
 import { createMenu } from "./ui/menu.js";
-import { createAskDialog } from "./ui/ask_dialog.js?v=1775350601";
 import { createUiPromptDialog } from "./ui/ui_prompt_dialog.js";
-import { createAgentLauncher } from "./ui/agent_launcher.js";
-import { createReviewLauncher } from "./ui/review_launcher.js";
 import { createSessionBranchLauncher } from "./ui/session_branch_launcher.js";
 import { createSidebar } from "./ui/sidebar.js";
 
@@ -81,6 +78,43 @@ const btnAttach = document.getElementById("btn-attach");
 // the exact full transcript (including reasoning/thinking blocks) in the background.
 const LOAD_FULL_SESSION_HISTORY = true;
 const MAX_PENDING_ATTACHMENTS = 12;
+
+const slashAutocompleteStyle = document.createElement("style");
+slashAutocompleteStyle.textContent = `
+#slash-autocomplete {
+	position: absolute;
+	bottom: calc(100% + 8px);
+	left: 0;
+	right: 0;
+	max-height: 240px;
+	overflow-y: auto;
+	background: var(--surface);
+	border: 1px solid var(--border);
+	border-radius: 8px;
+	box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+	z-index: 1000;
+	font-size: 13px;
+	display: none;
+}
+#slash-autocomplete.visible { display: block; }
+.slash-item {
+	display: flex;
+	align-items: center;
+	padding: 8px 12px;
+	gap: 10px;
+	cursor: pointer;
+	border-bottom: 1px solid rgba(255,255,255,0.04);
+}
+.slash-item:last-child { border-bottom: none; }
+.slash-item.active { background: var(--accent); color: #fff; }
+.slash-name { font-weight: 600; min-width: 80px; white-space: nowrap; }
+.slash-desc { flex: 1; color: var(--text-secondary); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.slash-item.active .slash-desc { color: rgba(255,255,255,0.7); }
+.slash-cat { font-size: 10px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
+.slash-item.active .slash-cat { color: rgba(255,255,255,0.5); }
+body.light .slash-item.active { background: var(--accent); color: #fff; }
+`;
+document.head.appendChild(slashAutocompleteStyle);
 
 const btnHistory = document.getElementById("btn-history");
 const btnLastVoice = document.getElementById("btn-last-voice");
@@ -141,10 +175,7 @@ let workingFrame = 0;
 
 let sidebarCtrl = null;
 let menuCtrl = null;
-let askDialog = null;
 let uiPromptDialog = null;
-let agentLauncher = null;
-let reviewLauncher = null;
 let branchLauncher = null;
 let terminalPane = null;
 let pendingAttachments = [];
@@ -155,6 +186,171 @@ let promptHistorySessionId = null;
 let lastComposerSessionId = null;
 let lastBranchLauncherSessionId = null;
 const sessionDrafts = new Map(); // sessionId → draft text
+const slashAutocomplete = document.createElement("div");
+slashAutocomplete.id = "slash-autocomplete";
+slashAutocomplete.setAttribute("role", "listbox");
+slashAutocomplete.setAttribute("aria-label", "Slash command suggestions");
+const slashAutocompleteContainer = input.parentElement;
+if (slashAutocompleteContainer) {
+	if (getComputedStyle(slashAutocompleteContainer).position === "static") slashAutocompleteContainer.style.position = "relative";
+	slashAutocompleteContainer.appendChild(slashAutocomplete);
+}
+let slashMatches = [];
+let slashSelectedIndex = 0;
+let slashRangeStart = -1;
+let slashRangeEnd = -1;
+
+function normalizeSlashCommandName(name) {
+	const trimmed = String(name || "").trim();
+	if (!trimmed) return "";
+	return trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+}
+
+function getSlashAutocompleteCommands() {
+	const active = sessionCtrl?.getActiveState?.() || activeState;
+	const commands = Array.isArray(active?.commands) ? active.commands : [];
+	const result = [];
+	const seen = new Set();
+	for (const command of commands) {
+		const name = normalizeSlashCommandName(command?.name);
+		const key = name.toLowerCase();
+		if (!name || seen.has(key)) continue;
+		seen.add(key);
+		result.push({
+			name,
+			description: String(command?.description || ""),
+			category: String(command?.source || "command"),
+		});
+	}
+	if (active?.sessionId || activeSessionId) {
+		for (const command of [
+			{ name: "/tree", description: "Browse checkpoints and branches", category: "session" },
+			{ name: "/fork", description: "Fork from an earlier message", category: "session" },
+		]) {
+			const key = command.name.toLowerCase();
+			if (seen.has(key)) continue;
+			seen.add(key);
+			result.push(command);
+		}
+	}
+	return result.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function isSlashAutocompleteVisible() {
+	return slashAutocomplete.classList.contains("visible");
+}
+
+function hideSlashAutocomplete() {
+	slashAutocomplete.classList.remove("visible");
+	slashAutocomplete.textContent = "";
+	slashMatches = [];
+	slashSelectedIndex = 0;
+	slashRangeStart = -1;
+	slashRangeEnd = -1;
+}
+
+function getSlashCommandContext() {
+	const cursor = input.selectionStart;
+	if (typeof cursor !== "number" || cursor !== input.selectionEnd) return null;
+	const textBeforeCursor = input.value.slice(0, cursor);
+	const lineStart = textBeforeCursor.lastIndexOf("\n") + 1;
+	const currentLine = textBeforeCursor.slice(lineStart);
+	const slashIndex = currentLine.lastIndexOf("/");
+	if (slashIndex < 0) return null;
+	const prefix = currentLine.slice(slashIndex + 1);
+	if (/\s/.test(prefix)) return null;
+	return {
+		prefix,
+		start: lineStart + slashIndex,
+		end: cursor,
+	};
+}
+
+function setSlashSelectedIndex(index) {
+	if (slashMatches.length === 0) return;
+	slashSelectedIndex = (index + slashMatches.length) % slashMatches.length;
+	const items = slashAutocomplete.querySelectorAll(".slash-item");
+	items.forEach((item, itemIndex) => {
+		item.classList.toggle("active", itemIndex === slashSelectedIndex);
+		item.setAttribute("aria-selected", itemIndex === slashSelectedIndex ? "true" : "false");
+	});
+	items[slashSelectedIndex]?.scrollIntoView?.({ block: "nearest" });
+}
+
+function renderSlashAutocomplete() {
+	slashAutocomplete.textContent = "";
+	slashMatches.forEach((command, index) => {
+		const item = document.createElement("div");
+		item.className = `slash-item${index === slashSelectedIndex ? " active" : ""}`;
+		item.dataset.command = command.name;
+		item.setAttribute("role", "option");
+		item.setAttribute("aria-selected", index === slashSelectedIndex ? "true" : "false");
+
+		const name = document.createElement("span");
+		name.className = "slash-name";
+		name.textContent = command.name;
+		item.appendChild(name);
+
+		const description = document.createElement("span");
+		description.className = "slash-desc";
+		description.textContent = command.description;
+		item.appendChild(description);
+
+		const category = document.createElement("span");
+		category.className = "slash-cat";
+		category.textContent = command.category;
+		item.appendChild(category);
+
+		item.addEventListener("mouseenter", () => setSlashSelectedIndex(index));
+		item.addEventListener("mousedown", (event) => {
+			event.preventDefault();
+			setSlashSelectedIndex(index);
+			insertSelectedSlashCommand();
+		});
+		slashAutocomplete.appendChild(item);
+	});
+}
+
+function updateSlashAutocomplete() {
+	const context = getSlashCommandContext();
+	if (!context) {
+		hideSlashAutocomplete();
+		return;
+	}
+	const needle = `/${context.prefix}`.toLowerCase();
+	const matches = getSlashAutocompleteCommands().filter((command) => command.name.toLowerCase().startsWith(needle));
+	if (matches.length === 0) {
+		hideSlashAutocomplete();
+		return;
+	}
+	slashMatches = matches;
+	slashSelectedIndex = 0;
+	slashRangeStart = context.start;
+	slashRangeEnd = context.end;
+	renderSlashAutocomplete();
+	slashAutocomplete.classList.add("visible");
+}
+
+function insertSelectedSlashCommand() {
+	if (!isSlashAutocompleteVisible() || slashMatches.length === 0) return false;
+	const command = slashMatches[slashSelectedIndex];
+	if (!command) return false;
+	const context = getSlashCommandContext();
+	const start = context?.start ?? slashRangeStart;
+	const end = context?.end ?? slashRangeEnd;
+	if (start < 0 || end < start) return false;
+	const before = input.value.slice(0, start);
+	const after = input.value.slice(end);
+	const inserted = `${command.name} `;
+	input.value = `${before}${inserted}${after}`;
+	const cursor = before.length + inserted.length;
+	input.setSelectionRange(cursor, cursor);
+	autoResize(input);
+	resetPromptHistoryNavigation();
+	hideSlashAutocomplete();
+	input.focus();
+	return true;
+}
 
 function syncSessionUrl(sessionId) {
 	if (replayName) return;
@@ -793,13 +989,11 @@ function updateControls() {
 	const actionBusy = sessionCtrl.getActionBusy ? sessionCtrl.getActionBusy() : null;
 	const canChangeSettings = hasSession && isController && !streaming && !actionBusy;
 	const hasPromptHistory = hasSession && getSessionPromptHistory(activeSessionId).length > 0;
-	askDialog?.setActiveSession?.(activeSessionId, isController);
-	askDialog?.reconcile?.(activeSessionId, activeState?.pendingAskIds || []);
 	uiPromptDialog?.reconcile?.(activeState?.pendingUiPromptIds || [], isController);
 	terminalPane?.syncSession?.({
 		sessionId: activeSessionId,
 		cwd: activeState?.cwd || "",
-		canWrite: isController,
+		canWrite: hasSession ? isController : true,
 	});
 
 	btnAbort.disabled = !hasSession || Boolean(actionBusy && actionBusy !== "abort" && actionBusy !== "bash");
@@ -914,15 +1108,9 @@ async function sendPromptFromInput() {
 
 function closeOpenOverlays() {
 	let closed = false;
-	if (askDialog?.isOpen?.()) {
-		askDialog.close(undefined, true);
-		closed = true;
-	}
 	if (menuOverlay?.classList?.contains("open")) {
 		menuCtrl?.close?.();
 		uiPromptDialog?.close?.();
-		agentLauncher?.close?.();
-		reviewLauncher?.close?.();
 		branchLauncher?.close?.();
 		closed = true;
 	}
@@ -966,24 +1154,6 @@ const sessionCtrl = createSessionController({
 	},
 	onSidebarClose: () => sidebarCtrl?.setOpen(false),
 	onSidebarRefresh: () => sidebarCtrl?.refresh(),
-	onAskRequest: (sessionId, askId, questions) => {
-		if (!sessionCtrl.isController()) return;
-		// Mark session as needing attention if it's not the currently active one
-		if (sessionId !== sessionCtrl.getActiveSessionId?.()) {
-			sidebarCtrl?.markNeedsAttention?.(sessionId);
-		}
-		if (askDialog) {
-			askDialog.show(sessionId, askId, questions, (id, cancelled, selections) => {
-				// Clear attention when user responds
-				if (sessionId) sidebarCtrl?.clearAttention?.(sessionId);
-				void sessionCtrl.sendAskResponse(id, cancelled, selections);
-			});
-		}
-	},
-	onAskClosed: (sessionId, askId) => {
-		if (sessionId) sidebarCtrl?.clearAttention?.(sessionId);
-		askDialog?.close?.(sessionId, false, askId);
-	},
 	onUiSelect: (uiId, title, options) => {
 		if (uiPromptDialog) {
 			uiPromptDialog.showSelect(uiId, title, options, (id, cancelled, value) => {
@@ -1012,7 +1182,6 @@ const sessionCtrl = createSessionController({
 		reusePrompt(text);
 	},
 	onSessionEnded: (sessionId) => {
-		askDialog?.close?.(sessionId, false);
 		uiPromptDialog?.close?.();
 	},
 	loadFullHistory: LOAD_FULL_SESSION_HISTORY,
@@ -1108,7 +1277,7 @@ menuCtrl = createMenu({
 	},
 	onToggleVoiceTranscriptionMode: () => {
 		const current = getVoiceTranscriptionMode();
-		const next = current === "web-speech" ? "parakeet" : "web-speech";
+		const next = current === "web-speech" ? "chatgpt" : "web-speech";
 		setVoiceTranscriptionMode(next);
 		// Recreate voice recorder with new setting
 		if (voiceRecorder) {
@@ -1147,12 +1316,6 @@ menuCtrl = createMenu({
 		if (launcherCommand.matched) return;
 		await sessionCtrl.sendPrompt(value);
 	},
-	onRunAgent: () => {
-		if (agentLauncher) agentLauncher.show();
-	},
-	onRunReview: () => {
-		if (reviewLauncher) reviewLauncher.show();
-	},
 	onRunTree: () => {
 		openTreeLauncher();
 	},
@@ -1161,18 +1324,7 @@ menuCtrl = createMenu({
 	},
 });
 
-askDialog = createAskDialog({ host: chat, getSendOnEnter: () => sendOnEnter });
 uiPromptDialog = createUiPromptDialog({ menuOverlay, menuScrim, menuPanel });
-agentLauncher = createAgentLauncher({
-	menuOverlay, menuPanel, api,
-	getActiveState: () => sessionCtrl.getActiveState(),
-	onSubmit: (cmd) => void sessionCtrl.sendPrompt(cmd),
-});
-reviewLauncher = createReviewLauncher({
-	menuOverlay, menuPanel, api,
-	getActiveState: () => sessionCtrl.getActiveState(),
-	onSubmit: (cmd) => void sessionCtrl.sendPrompt(cmd),
-});
 branchLauncher = createSessionBranchLauncher({
 	menuOverlay,
 	menuPanel,
@@ -1256,7 +1408,7 @@ function getTerminalPaneStateSnapshot() {
 	return {
 		sessionId: activeSessionId,
 		cwd: activeState?.cwd || "",
-		canWrite: Boolean(activeSessionId && sessionCtrl.isController()),
+		canWrite: activeSessionId ? sessionCtrl.isController() : true,
 	};
 }
 
@@ -1268,7 +1420,7 @@ async function ensureTerminalPaneLoaded({ showNotice = false } = {}) {
 	}
 	if (!terminalPaneLoadPromise) {
 		ensureTerminalPaneStylesLoaded();
-		terminalPaneLoadPromise = import("./terminal/pane.js?v=1776100001")
+		terminalPaneLoadPromise = import("./terminal/pane.js?v=1776100002")
 			.then((module) => {
 				if (typeof module?.createTerminalPane !== "function") {
 					throw new Error("Terminal pane module is missing createTerminalPane().");
@@ -1668,8 +1820,31 @@ if (btnScrollBottom && msgs) {
 input.addEventListener("input", () => {
 	autoResize(input);
 	resetPromptHistoryNavigation();
+	updateSlashAutocomplete();
 });
 input.addEventListener("keydown", (e) => {
+	if (!e.isComposing && isSlashAutocompleteVisible()) {
+		if (e.key === "ArrowDown") {
+			e.preventDefault();
+			setSlashSelectedIndex(slashSelectedIndex + 1);
+			return;
+		}
+		if (e.key === "ArrowUp") {
+			e.preventDefault();
+			setSlashSelectedIndex(slashSelectedIndex - 1);
+			return;
+		}
+		if (e.key === "Enter" || e.key === "Tab") {
+			e.preventDefault();
+			insertSelectedSlashCommand();
+			return;
+		}
+		if (e.key === "Escape") {
+			e.preventDefault();
+			hideSlashAutocomplete();
+			return;
+		}
+	}
 	if (!e.isComposing && !e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
 		if (e.key === "ArrowUp" && navigatePromptHistory("up")) {
 			e.preventDefault();
@@ -1693,6 +1868,8 @@ input.addEventListener("keydown", (e) => {
 		sendPromptFromInput();
 	}
 });
+input.addEventListener("click", updateSlashAutocomplete);
+input.addEventListener("blur", () => setTimeout(hideSlashAutocomplete, 0));
 
 window.addEventListener("paste", async (e) => {
 	const files = Array.from(e.clipboardData?.files || []).filter((file) => file && String(file.type || "").startsWith("image/"));
@@ -1706,6 +1883,11 @@ window.addEventListener("paste", async (e) => {
 });
 
 window.addEventListener("keydown", (e) => {
+	if (e.altKey && e.key === "p" && !e.ctrlKey && !e.metaKey) {
+		e.preventDefault();
+		void menuCtrl.openModelMenu();
+		return;
+	}
 	if (e.key === "Escape") {
 		if (terminalPane?.handleGlobalKeydown?.(e)) return;
 		e.preventDefault();
@@ -1823,7 +2005,6 @@ if (replayName) {
 	void sessionCtrl.runReplay(replayName);
 } else {
 	void sidebarCtrl.refresh().then(() => openSessionFromParam());
-	setInterval(() => void sidebarCtrl.refresh(), 5_000);
 }
 
 if (faceIdEnabled) void faceIdGuard.start();

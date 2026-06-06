@@ -10,7 +10,7 @@ describe("resolvePushRoutingDecision", () => {
 				{ endpoint: "https://web.push.apple.com/abc", clientId: "phone", platform: "iPhone", updatedAt: new Date(now - 1000).toISOString() },
 			],
 			clients: [
-				{ clientId: "phone", sessionId: "sess-1", visible: true, focused: true, lastSeenAtMs: now },
+				{ clientId: "phone", sessionId: "sess-2", visible: true, focused: true, lastSeenAtMs: now },
 			],
 		}, now);
 

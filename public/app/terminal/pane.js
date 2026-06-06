@@ -5,7 +5,10 @@ import { WebLinksAddon } from "/vendor/xterm/addon-web-links.mjs"
 
 function wsUrlForSession(sessionId, clientId, token) {
 	const base = window.location.protocol === "https:" ? "wss" : "ws"
-	const url = new URL(`${base}://${window.location.host}/api/sessions/${encodeURIComponent(sessionId)}/terminal`)
+	const terminalPath = sessionId
+		? `/api/sessions/${encodeURIComponent(sessionId)}/terminal`
+		: "/api/sessions/scratch/terminal"
+	const url = new URL(`${base}://${window.location.host}${terminalPath}`)
 	url.searchParams.set("clientId", clientId)
 	if (token) url.searchParams.set("token", token)
 	return url.toString()
@@ -19,6 +22,9 @@ const TERMINAL_PADDING_Y = 18
 const TERMINAL_OVERVIEW_RULER_WIDTH = 14
 const MIN_TERMINAL_COLS = 20
 const MIN_TERMINAL_ROWS = 6
+const TERMINAL_RECONNECT_INITIAL_DELAY_MS = 1000
+const TERMINAL_RECONNECT_MAX_DELAY_MS = 15000
+const TERMINAL_RESIZE_DEBOUNCE_MS = 200
 
 function getTerminalFontSize(mobileMode) {
 	return mobileMode ? MOBILE_TERMINAL_FONT_SIZE : DESKTOP_TERMINAL_FONT_SIZE
@@ -69,57 +75,57 @@ function estimateTerminalSize(stageEl, mobileMode) {
 function buildTerminalTheme() {
 	const css = getComputedStyle(document.body)
 	const isLight = document.body.classList.contains("light")
-	const foreground = (css.getPropertyValue("--text-body") || (isLight ? "#2A2A32" : "#d4d4da")).trim() || (isLight ? "#2A2A32" : "#d4d4da")
+	const foreground = isLight ? "#111111" : "#f1f1f1"
 	const accent = (css.getPropertyValue("--accent") || (isLight ? "#2D8A7E" : "#7EC8C0")).trim() || (isLight ? "#2D8A7E" : "#7EC8C0")
 	const accentStrong = (css.getPropertyValue("--accent-strong") || accent).trim() || accent
-	const muted = (css.getPropertyValue("--text-muted") || (isLight ? "#8A8A98" : "#636370")).trim() || (isLight ? "#8A8A98" : "#636370")
+	const muted = isLight ? "#555566" : "#aaaaaa"
 	if (isLight) {
 		return {
-			background: "#FBFBFD",
+			background: "#ffffff",
 			foreground,
-			cursor: accent,
+			cursor: "#000000",
 			cursorAccent: "#ffffff",
-			selectionBackground: "rgba(45, 138, 126, 0.18)",
-			black: "#1F2937",
-			red: "#D32F2F",
-			green: "#2E7D32",
-			yellow: "#B7791F",
-			blue: "#2563EB",
-			magenta: "#7C3AED",
-			cyan: accent,
-			white: "#D5DCE7",
+			selectionBackground: "rgba(45, 138, 126, 0.3)",
+			black: "#000000",
+			red: "#cc0000",
+			green: "#4e9a06",
+			yellow: "#c4a000",
+			blue: "#3465a4",
+			magenta: "#75507b",
+			cyan: "#06989a",
+			white: "#d3d7cf",
 			brightBlack: muted,
-			brightRed: "#EF4444",
-			brightGreen: "#16A34A",
-			brightYellow: "#CA8A04",
-			brightBlue: "#3B82F6",
-			brightMagenta: "#A855F7",
-			brightCyan: accentStrong,
-			brightWhite: "#111827",
+			brightRed: "#ef2929",
+			brightGreen: "#8ae234",
+			brightYellow: "#fce94f",
+			brightBlue: "#729fcf",
+			brightMagenta: "#ad7fa8",
+			brightCyan: "#34e2e2",
+			brightWhite: "#eeeeec",
 		}
 	}
 	return {
-		background: "#090c11",
+		background: "#000000",
 		foreground,
-		cursor: accent,
-		cursorAccent: "#0c0c0e",
-		selectionBackground: "rgba(126, 200, 192, 0.22)",
-		black: "#0f1720",
-		red: "#f87171",
-		green: "#6ee7a0",
-		yellow: "#fbbf40",
-		blue: "#60a5fa",
-		magenta: "#c084fc",
-		cyan: accent,
-		white: foreground,
+		cursor: "#ffffff",
+		cursorAccent: "#000000",
+		selectionBackground: "rgba(126, 200, 192, 0.4)",
+		black: "#2e3436",
+		red: "#cc0000",
+		green: "#4e9a06",
+		yellow: "#c4a000",
+		blue: "#3465a4",
+		magenta: "#75507b",
+		cyan: "#06989a",
+		white: "#d3d7cf",
 		brightBlack: muted,
-		brightRed: "#fca5a5",
-		brightGreen: "#86efac",
-		brightYellow: "#fde68a",
-		brightBlue: "#93c5fd",
-		brightMagenta: "#d8b4fe",
-		brightCyan: "#99f6e4",
-		brightWhite: "#ffffff",
+		brightRed: "#ef2929",
+		brightGreen: "#8ae234",
+		brightYellow: "#fce94f",
+		brightBlue: "#729fcf",
+		brightMagenta: "#ad7fa8",
+		brightCyan: "#34e2e2",
+		brightWhite: "#eeeeec",
 	}
 }
 
@@ -363,6 +369,8 @@ export function createTerminalPane({
 		keyboardInset: 0,
 		keyboardSyncTimer: null,
 		fitFrame: 0,
+		resizeDebounceTimer: null,
+		pendingInputMessages: [],
 	}
 
 	function notice(message, kind = "info") {
@@ -388,7 +396,7 @@ export function createTerminalPane({
 		if (previousInset > 0 && nextInset === 0 && document.activeElement === searchInput) {
 			try { searchInput.blur() } catch {}
 		}
-		fitActiveTerminal()
+		scheduleFitActiveTerminal()
 	}
 
 	function scheduleKeyboardInsetSync() {
@@ -404,6 +412,13 @@ export function createTerminalPane({
 		if (state.reconnectTimer) {
 			clearTimeout(state.reconnectTimer)
 			state.reconnectTimer = null
+		}
+	}
+
+	function clearResizeDebounceTimer() {
+		if (state.resizeDebounceTimer) {
+			clearTimeout(state.resizeDebounceTimer)
+			state.resizeDebounceTimer = null
 		}
 	}
 
@@ -431,19 +446,19 @@ export function createTerminalPane({
 		const hasTabs = state.tabs.size > 0
 		emptyEl.hidden = hasTabs
 		if (hasTabs) return
-		if (!state.sessionId) {
-			emptyEl.textContent = "Open a session to start a terminal."
-			setStatus("Open a session to start a terminal.")
+		if (!state.connected && !state.connecting) {
+			emptyEl.textContent = "Connecting home terminal…"
+			setStatus("Connecting home terminal…")
 			return
 		}
 		if (state.connecting) {
-			emptyEl.textContent = "Connecting terminal…"
-			setStatus("Connecting terminal…", "warning")
+			emptyEl.textContent = state.sessionId ? "Connecting terminal…" : "Connecting home terminal…"
+			setStatus(state.sessionId ? "Connecting terminal…" : "Connecting home terminal…")
 			return
 		}
 		if (!state.connected) {
-			emptyEl.textContent = "Terminal disconnected. Reconnecting…"
-			setStatus("Terminal disconnected. Reconnecting…", "warning")
+			emptyEl.textContent = "Reconnecting terminal…"
+			setStatus("Reconnecting terminal…")
 			return
 		}
 		if (state.canWrite) {
@@ -466,12 +481,8 @@ export function createTerminalPane({
 	}
 
 	function renderStatus() {
-		if (!state.sessionId) {
-			setStatus("Open a session to start a terminal.")
-			return
-		}
 		if (!state.connected) {
-			setStatus(state.connecting ? "Connecting terminal…" : "Terminal disconnected. Reconnecting…", "warning")
+			setStatus(state.connecting ? "Connecting terminal…" : "Reconnecting terminal…")
 			return
 		}
 		const active = state.activeTabId ? state.tabs.get(state.activeTabId) : null
@@ -513,6 +524,14 @@ export function createTerminalPane({
 		state.fitFrame = requestAnimationFrame(() => {
 			state.fitFrame = requestAnimationFrame(() => attemptFit(retries))
 		})
+	}
+
+	function scheduleFitActiveTerminal(delay = TERMINAL_RESIZE_DEBOUNCE_MS) {
+		clearResizeDebounceTimer()
+		state.resizeDebounceTimer = setTimeout(() => {
+			state.resizeDebounceTimer = null
+			fitActiveTerminal()
+		}, delay)
 	}
 
 	function selectTab(tabId, options = {}) {
@@ -729,6 +748,18 @@ export function createTerminalPane({
 		return local
 	}
 
+	function flushPendingInputMessages() {
+		if (!state.ws || state.ws.readyState !== WebSocket.OPEN || state.pendingInputMessages.length === 0) return
+		const pending = state.pendingInputMessages.splice(0, state.pendingInputMessages.length)
+		for (const message of pending) {
+			if (!message?.tabId || !state.tabs.has(message.tabId)) continue
+			try { state.ws.send(JSON.stringify(message)) } catch {
+				state.pendingInputMessages.unshift(message)
+				break
+			}
+		}
+	}
+
 	function handleInit(message) {
 		const prevActive = state.activeTabId
 		clearLocalTabs()
@@ -746,6 +777,8 @@ export function createTerminalPane({
 		applyTheme()
 		if (state.tabs.size === 0 && state.canWrite) {
 			createNewTab()
+		} else {
+			flushPendingInputMessages()
 		}
 	}
 
@@ -848,9 +881,12 @@ export function createTerminalPane({
 	}
 
 	function scheduleReconnect() {
-		if (!state.open || !state.sessionId || state.ws || state.connecting || state.reconnectTimer) return
+		if (!state.open || state.ws || state.connecting || state.reconnectTimer) return
 		if (document.visibilityState === "hidden") return
-		const delay = Math.min(5000, 600 * Math.max(1, state.reconnectAttempts + 1))
+		const delay = Math.min(
+			TERMINAL_RECONNECT_MAX_DELAY_MS,
+			TERMINAL_RECONNECT_INITIAL_DELAY_MS * (2 ** Math.max(0, state.reconnectAttempts - 1)),
+		)
 		state.reconnectTimer = setTimeout(() => {
 			state.reconnectTimer = null
 			connect()
@@ -870,14 +906,18 @@ export function createTerminalPane({
 			ws.onmessage = null
 			try { ws.close() } catch {}
 		}
-		if (clearTabs) clearLocalTabs()
+		if (clearTabs) {
+			clearLocalTabs()
+			state.pendingInputMessages = []
+		}
 		state.stickyCtrl = false
 		renderCtrlState()
+		clearResizeDebounceTimer()
 		renderEmptyState()
 	}
 
 	function connect() {
-		if (!state.open || !state.sessionId || state.ws || state.connecting) return
+		if (!state.open || state.ws || state.connecting) return
 		if (document.visibilityState === "hidden") return
 		clearReconnectTimer()
 		state.connecting = true
@@ -905,34 +945,30 @@ export function createTerminalPane({
 		} catch (error) {
 			state.connecting = false
 			state.reconnectAttempts += 1
-			notice(error instanceof Error ? error.message : String(error), "error")
 			renderEmptyState()
 			scheduleReconnect()
 		}
 	}
 
 	function send(message) {
-		if (!state.open || !state.sessionId) return false
+		if (!state.open) return false
 		if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+			if (message?.type === "input") state.pendingInputMessages.push(message)
 			connect()
-			return false
+			return message?.type === "input"
 		}
 		try {
 			state.ws.send(JSON.stringify(message))
 			return true
 		} catch (error) {
-			notice(error instanceof Error ? error.message : String(error), "error")
-			return false
+			if (message?.type === "input") state.pendingInputMessages.push(message)
+			return message?.type === "input"
 		}
 	}
 
 	function createNewTab() {
-		if (!state.sessionId) {
-			notice("Open a session first", "warning")
-			return false
-		}
 		if (!state.canWrite) {
-			notice("Take over the session to open a terminal", "warning")
+			notice(state.sessionId ? "Take over the session to open a terminal" : "Terminal is not writable", "warning")
 			return false
 		}
 		const active = activeLocalTab()
@@ -1028,6 +1064,7 @@ export function createTerminalPane({
 			}
 			closeSearch()
 			closeSocket({ clearTabs: true })
+			state.pendingInputMessages = []
 			return
 		}
 		renderEmptyState()
@@ -1049,7 +1086,7 @@ export function createTerminalPane({
 			closeSocket({ clearTabs: true })
 		}
 		updateTerminalPermissions()
-		if (state.open && state.sessionId) connect()
+		if (state.open) connect()
 		renderEmptyState()
 		renderStatus()
 	}
@@ -1121,13 +1158,17 @@ export function createTerminalPane({
 		})
 	}
 
-	new ResizeObserver(() => fitActiveTerminal()).observe(stageEl)
+	new ResizeObserver(() => scheduleFitActiveTerminal()).observe(stageEl)
 	window.addEventListener("resize", () => {
-		fitActiveTerminal()
+		scheduleFitActiveTerminal()
+		scheduleKeyboardInsetSync()
+	})
+	window.addEventListener("orientationchange", () => {
+		scheduleFitActiveTerminal()
 		scheduleKeyboardInsetSync()
 	})
 	window.visualViewport?.addEventListener("resize", () => {
-		fitActiveTerminal()
+		scheduleFitActiveTerminal()
 		scheduleKeyboardInsetSync()
 	})
 	document.fonts?.ready?.then(() => fitActiveTerminal()).catch(() => {})
@@ -1137,7 +1178,7 @@ export function createTerminalPane({
 	document.addEventListener("visibilitychange", () => {
 		if (document.visibilityState === "visible") {
 			scheduleKeyboardInsetSync()
-			if (state.open && state.sessionId && !state.ws) connect()
+			if (state.open && !state.ws) connect()
 		}
 	})
 
