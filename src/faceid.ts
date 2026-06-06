@@ -49,23 +49,32 @@ const CHALLENGE_TTL_MS = 90_000;
 
 export class FaceIdService {
 	private storePath: string;
+	private legacyStorePath: string | null;
 	private challenges = new Map<string, ChallengeRecord>();
 
-	constructor(storePath = join(homedir(), ".pi", "agent", "pi-web", "faceid-credentials.json")) {
+	constructor(
+		storePath = join(homedir(), ".omp", "agent", "omp-mobile", "faceid-credentials.json"),
+		legacyStorePath: string | null = join(homedir(), ".pi", "agent", "pi-web", "faceid-credentials.json"),
+	) {
 		this.storePath = storePath;
+		this.legacyStorePath = legacyStorePath;
 	}
 
 	private async readStore(): Promise<FaceIdStore> {
-		try {
-			const raw = await readFile(this.storePath, "utf8");
-			const parsed = JSON.parse(raw) as Partial<FaceIdStore>;
-			if (parsed.version !== 2 || !parsed.rpCredentials || typeof parsed.rpCredentials !== "object") {
-				return { version: 2, rpCredentials: {} };
+		const paths = [this.storePath, this.legacyStorePath].filter((path): path is string => Boolean(path));
+		for (const path of paths) {
+			try {
+				const raw = await readFile(path, "utf8");
+				const parsed = JSON.parse(raw) as Partial<FaceIdStore>;
+				if (parsed.version !== 2 || !parsed.rpCredentials || typeof parsed.rpCredentials !== "object") {
+					continue;
+				}
+				return { version: 2, rpCredentials: parsed.rpCredentials };
+			} catch {
+				// try next path
 			}
-			return { version: 2, rpCredentials: parsed.rpCredentials };
-		} catch {
-			return { version: 2, rpCredentials: {} };
 		}
+		return { version: 2, rpCredentials: {} };
 	}
 
 	private async writeStore(store: FaceIdStore): Promise<void> {
@@ -119,10 +128,10 @@ export class FaceIdService {
 
 		if (kind === "register") {
 			const options = await generateRegistrationOptions({
-				rpName: "pi-web",
+				rpName: "omp-mobile",
 				rpID: rpId,
-				userName: `pi-web@${rpId}`,
-				userDisplayName: "pi-web operator",
+				userName: `omp-mobile@${rpId}`,
+				userDisplayName: "omp-mobile operator",
 				timeout: 60_000,
 				attestationType: "none",
 				authenticatorSelection: {

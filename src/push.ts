@@ -357,11 +357,16 @@ export function resolvePushRoutingDecision(
 
 export class PushService {
 	private storePath: string;
+	private legacyStorePath: string | null;
 	private data: StoredPushData | null = null;
 	private clientStates = new Map<string, ClientActivityState>();
 
-	constructor(storePath = join(homedir(), ".pi", "agent", "pi-web", "push.json")) {
+	constructor(
+		storePath = join(homedir(), ".omp", "agent", "omp-mobile", "push.json"),
+		legacyStorePath: string | null = join(homedir(), ".pi", "agent", "pi-web", "push.json"),
+	) {
 		this.storePath = storePath;
+		this.legacyStorePath = legacyStorePath;
 	}
 
 	async init(preferredSubject?: string | null): Promise<void> {
@@ -493,7 +498,7 @@ export class PushService {
 			sessionName: payload.sessionName,
 			icon: payload.icon || "/icon-192.png",
 			badge: payload.badge || "/apple-touch-icon.png",
-			tag: payload.tag || payload.sessionId || "pi-session",
+			tag: payload.tag || payload.sessionId || "omp-mobile-session",
 		};
 
 		let sent = 0;
@@ -532,28 +537,31 @@ export class PushService {
 	}
 
 	private async load(preferredSubject?: string | null): Promise<{ data: StoredPushData; changed: boolean }> {
-		try {
-			const raw = await readFile(this.storePath, "utf8");
-			const parsed = safeParse<StoredPushData>(raw);
-			if (parsed && parsed.version === 1 && parsed.vapid?.publicKey && parsed.vapid?.privateKey) {
-				const subject = resolvePushSubject(parsed.vapid.subject, preferredSubject);
-				return {
-					data: {
-						version: 1,
-						vapid: {
-							publicKey: parsed.vapid.publicKey,
-							privateKey: parsed.vapid.privateKey,
-							subject,
+		const paths = [this.storePath, this.legacyStorePath].filter((path): path is string => Boolean(path));
+		for (const path of paths) {
+			try {
+				const raw = await readFile(path, "utf8");
+				const parsed = safeParse<StoredPushData>(raw);
+				if (parsed && parsed.version === 1 && parsed.vapid?.publicKey && parsed.vapid?.privateKey) {
+					const subject = resolvePushSubject(parsed.vapid.subject, preferredSubject);
+					return {
+						data: {
+							version: 1,
+							vapid: {
+								publicKey: parsed.vapid.publicKey,
+								privateKey: parsed.vapid.privateKey,
+								subject,
+							},
+							subscriptions: Array.isArray(parsed.subscriptions)
+								? parsed.subscriptions.map((sub) => normalizeStoredSubscription(sub)).filter((sub): sub is StoredPushSubscription => Boolean(sub))
+								: [],
 						},
-						subscriptions: Array.isArray(parsed.subscriptions)
-							? parsed.subscriptions.map((sub) => normalizeStoredSubscription(sub)).filter((sub): sub is StoredPushSubscription => Boolean(sub))
-							: [],
-					},
-					changed: subject !== parsed.vapid.subject,
-				};
+						changed: path !== this.storePath || subject !== parsed.vapid.subject,
+					};
+				}
+			} catch {
+				// try next path
 			}
-		} catch {
-			// ignore
 		}
 
 		const vapid = webpush.generateVAPIDKeys();

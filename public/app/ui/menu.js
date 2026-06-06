@@ -820,7 +820,7 @@ export function createMenu({
                 }),
             );
 
-            addSection("Pi session");
+            addSection("OMP session");
             if (!prefs.hasSessionControl) {
                 const note = document.createElement("div");
                 note.className = "menu-item";
@@ -830,7 +830,7 @@ export function createMenu({
                 const secondary = document.createElement("div");
                 secondary.className = "secondary";
                 secondary.textContent =
-                    "Open a session and take over control to change pi runtime behavior.";
+                    "Open a session and take over control to change OMP runtime behavior.";
                 note.appendChild(primary);
                 note.appendChild(secondary);
                 body.appendChild(note);

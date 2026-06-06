@@ -1,5 +1,5 @@
-// Local structural types for pi-mobile.
-// Runtime loads the real implementation from the system-installed Pi package.
+// Local structural types for omp-mobile.
+// Runtime loads the real implementation from the system-installed OMP package.
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 export type Api = string & {};

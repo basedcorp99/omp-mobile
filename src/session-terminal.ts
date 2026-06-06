@@ -306,6 +306,8 @@ export class SessionTerminalManager {
 					COLORTERM: "truecolor",
 					PROMPT_EOL_MARK: "",
 					PWD: cwd,
+					OMP_MOBILE_TERMINAL: "1",
+					OMP_MOBILE_SESSION_ID: this.options.sessionId,
 					PI_WEB_TERMINAL: "1",
 					PI_WEB_SESSION_ID: this.options.sessionId,
 				},

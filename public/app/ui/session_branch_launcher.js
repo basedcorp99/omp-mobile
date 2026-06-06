@@ -212,7 +212,7 @@ function buildPreviewLine(entry) {
 function formatLoadError(error, mode) {
 	const message = error instanceof Error ? error.message : String(error || "");
 	if (message === "404 Not Found") {
-		return `${mode === "fork" ? "Fork" : "Tree"} isn't available in the running server yet. Restart pi-mobile and try again.`;
+		return `${mode === "fork" ? "Fork" : "Tree"} isn't available in the running server yet. Restart omp-mobile and try again.`;
 	}
 	return message || "Failed to load session history.";
 }
@@ -542,7 +542,7 @@ export function createSessionBranchLauncher({ menuOverlay, menuPanel, api, getAc
 					: state.summaryMode === "summary"
 						? "Summarize the branch you leave behind"
 						: `Custom summary prompt: ${state.customInstructions.trim() || "(not set yet)"}`
-				: "pi-mobile creates a new session right before this user message and loads that message into the composer.";
+				: "omp-mobile creates a new session right before this user message and loads that message into the composer.";
 			const actionText = mode === "fork"
 				? "Forking starts a new session right before this user message so you can edit and resend it."
 				: selected.isUserMessage

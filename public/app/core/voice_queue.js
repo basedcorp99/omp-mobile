@@ -1,4 +1,4 @@
-const DB_NAME = "pi-mobile-voice";
+const DB_NAME = "omp-mobile-voice";
 const STORE_NAME = "jobs";
 const DB_VERSION = 1;
 

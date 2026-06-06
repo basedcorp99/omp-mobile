@@ -240,10 +240,10 @@ export function installPushNotifications({ api, btnNotify, lblNotify, onNotice, 
 		}
 		const reg = await ensureRegistration();
 		try {
-			const title = "pi · test";
+			const title = "omp-mobile · test";
 			const options = {
-				body: "This is a test notification from pi-mobile.",
-				tag: `pi-mobile-test-${Date.now()}`,
+				body: "This is a test notification from omp-mobile.",
+				tag: `omp-mobile-test-${Date.now()}`,
 				icon: "/icon-192.png",
 				badge: "/icon-192.png",
 				data: { url: "/" },

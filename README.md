@@ -1,8 +1,8 @@
-# pi-mobile
+# omp-mobile
 
-Web UI for the `pi` coding agent (mobile + desktop).
+Web UI for the OMP coding agent (mobile + desktop).
 
-`pi-mobile` runs the agent on the host machine and lets you control sessions from browser clients (phone, tablet, laptop).
+`omp-mobile` runs the agent on the host machine and lets you control sessions from browser clients (phone, tablet, laptop).
 
 ## What it supports
 
@@ -14,55 +14,54 @@ Web UI for the `pi` coding agent (mobile + desktop).
 - Optional push notifications
 - Optional Face ID / Touch ID gate
 
-Sessions are JSONL on disk, same location as native `pi` CLI.
+Sessions are JSONL on disk, same location as the native `omp` CLI.
 
 ## Install
 
 ```bash
-git clone https://github.com/basedcorp99/pi-mobile.git
-cd pi-mobile
+git clone https://github.com/basedcorp99/omp-mobile.git
+cd omp-mobile
 ./setup.sh
 ```
 
 The setup script:
-- Installs `pi`, `pi-subagents`, and `pi-ask-tool-extension` globally via npm if missing
+- Installs the OMP package globally via npm if missing
 - Installs bun dependencies for the web app itself
-- Creates a `pi-mobile` launcher in `~/.bin` and adds it to PATH
-- Installs a repo-owned systemd unit at `/etc/systemd/system/pi-mobile.service`
-- Enables + starts the `pi-mobile` service
-- Installs the custom `/review` Pi extension to `~/.pi/agent/extensions/review.ts`
+- Creates a `omp-mobile` launcher in `~/.bin` and adds it to PATH
+- Installs a repo-owned systemd unit at `/etc/systemd/system/omp-mobile.service`
+- Enables + starts the `omp-mobile` service
 - Optionally installs voice transcription (Parakeet model, ~640MB)
 
-`pi-mobile` itself is a standalone web app repo, not a Pi package you should add to `~/.pi/agent/settings.json` under `packages`.
-At runtime, `pi-mobile` loads the system-installed `pi` package from your global npm directory, so the web UI tracks the same Pi version as your `pi` CLI.
-The `/review` extension source lives in `pi-extension/review.ts` and is copied into Pi's normal extension directory by `./setup.sh`.
+`omp-mobile` is a standalone web app repo, not a plugin package to add to OMP settings.
+At runtime, `omp-mobile` loads the system-installed OMP package from your global npm directory, so the web UI tracks the same OMP version as your `omp` CLI.
+Slash commands and ask-tool prompts come from OMP/ACP; there are no legacy Pi plugin installs in this repo.
 
 After setup:
 
 ```bash
-pi-mobile                              # manual run
-sudo systemctl restart pi-mobile       # managed service restart
-journalctl -u pi-mobile -f             # live logs
+omp-mobile                              # manual run
+sudo systemctl restart omp-mobile       # managed service restart
+journalctl -u omp-mobile -f             # live logs
 ```
 
 By default, `./setup.sh` installs the systemd service using:
-- `PI_MOBILE_HOST` if set
+- `OMP_MOBILE_HOST` if set
 - otherwise your Tailscale IPv4 if available
 - otherwise `127.0.0.1`
 
 You can override service bind settings during setup:
 
 ```bash
-PI_MOBILE_HOST=127.0.0.1 PI_MOBILE_PORT=4317 ./setup.sh
+OMP_MOBILE_HOST=127.0.0.1 OMP_MOBILE_PORT=4317 ./setup.sh
 ```
 
-See [RUNBOOK.md](./RUNBOOK.md) for systemd, Tailscale / Cloudflare / TLS / auth details, plus notes on the installed `/review` extension.
+See [RUNBOOK.md](./RUNBOOK.md) for systemd, Tailscale / Cloudflare / TLS / auth details.
 
 ## Prerequisites
 
 - [bun](https://bun.sh) runtime
-- Node.js / npm (used by `./setup.sh` to install global Pi packages)
-- [pi](https://github.com/badlogic/pi-mono) coding agent if you are installing manually without `./setup.sh`
+- Node.js / npm (used by `./setup.sh` to install the global OMP package)
+- OMP coding agent if you are installing manually without `./setup.sh`
 
 Optional (for voice input):
 - python3, numpy, onnxruntime
@@ -98,7 +97,7 @@ cp parakeet-transcribe ~/.bin/
 chmod +x ~/.bin/parakeet-transcribe
 ```
 
-pi-mobile checks these locations (first match wins):
+omp-mobile checks these locations (first match wins):
 - `~/.bin/parakeet-transcribe`
 - `/usr/local/bin/parakeet-transcribe`
 
@@ -111,7 +110,7 @@ tar -xzf /tmp/parakeet-v3-int8.tar.gz -C ~/.local/share
 rm /tmp/parakeet-v3-int8.tar.gz
 ```
 
-pi-mobile checks these locations (first match wins):
+omp-mobile checks these locations (first match wins):
 - `~/.local/share/parakeet-tdt-0.6b-v3-int8`
 - `/usr/local/share/parakeet-tdt-0.6b-v3-int8`
 
@@ -134,17 +133,21 @@ done
 
 | What | Path |
 |------|------|
-| Sessions (JSONL) | `~/.pi/agent/sessions/` |
-| Saved repos | `~/.pi/agent/pi-web/repos.json` |
-| Face ID credentials | `~/.pi/agent/pi-web/faceid-credentials.json` |
+| OMP sessions (JSONL) | OMP's native session directory |
+| Saved repos | `~/.omp/agent/omp-mobile/repos.json` |
+| Archived sessions | `~/.omp/agent/omp-mobile/archive.json` |
+| Push subscriptions | `~/.omp/agent/omp-mobile/push.json` |
+| Face ID credentials | `~/.omp/agent/omp-mobile/faceid-credentials.json` |
+
+The rename moves app-owned metadata out of the old `~/.pi/agent/pi-web` directory. Existing files there are read as a fallback and written forward to the new location when touched. Existing OMP session history is still owned by OMP itself.
 
 ## Session semantics
 
 - **Abort**: stops current run, keeps runtime alive.
-- **Release**: aborts and disposes runtime so you can safely resume the same JSONL in native `pi`.
+- **Release**: aborts and disposes runtime so you can safely resume the same JSONL in native `omp`.
 
-Do not open the same session in `pi-mobile` and native `pi` at the same time.
+Do not open the same session in `omp-mobile` and native `omp` at the same time.
 
 ## Credits
 
-Built on top of [pi](https://github.com/badlogic/pi-mono) by [badlogic](https://github.com/badlogic).
+Built on top of OMP (`@oh-my-pi/pi-coding-agent`).

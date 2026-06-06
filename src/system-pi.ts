@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-// pi-mobile intentionally loads OMP from the installed package so the web UI
+// omp-mobile intentionally loads OMP from the installed package so the web UI
 // stays aligned with the user's system `omp` CLI version.
 let cachedNpmRoot: string | null | undefined;
 let cachedPiModule: Promise<Record<string, any>> | null = null;

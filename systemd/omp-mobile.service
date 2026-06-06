@@ -1,5 +1,5 @@
 [Unit]
-Description=pi-mobile web UI
+Description=omp-mobile web UI
 After=network-online.target tailscaled.service
 Wants=network-online.target
 
@@ -11,7 +11,8 @@ ExecStart=__BUN__ src/server.ts --host __HOST__ --port __PORT__
 Restart=always
 RestartSec=3
 Environment=HOME=__HOME__
-Environment=PI_WEB_HOST=__HOST__
+Environment=OMP_MOBILE_HOST=__HOST__
+Environment=OMP_MOBILE_PORT=__PORT__
 
 [Install]
 WantedBy=multi-user.target

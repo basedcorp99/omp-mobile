@@ -60,7 +60,7 @@
     "event": {
       "type": "message_update",
       "message": { "role": "assistant", "content": [], "timestamp": 2 },
-      "assistantMessageEvent": { "type": "text_delta", "delta": "Sure — **hello** from `pi-web`." }
+      "assistantMessageEvent": { "type": "text_delta", "delta": "Sure — **hello** from `omp-mobile`." }
     }
   },
   {
@@ -71,7 +71,7 @@
         "role": "assistant",
         "content": [
           { "type": "thinking", "thinking": "i should read the readme now" },
-          { "type": "text", "text": "Sure — **hello** from `pi-web`." }
+          { "type": "text", "text": "Sure — **hello** from `omp-mobile`." }
         ],
         "stopReason": "stop",
         "timestamp": 2

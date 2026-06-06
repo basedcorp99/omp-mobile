@@ -8,7 +8,7 @@ exports[`golden: render model basic 1`] = `
   },
   {
     "notices": [],
-    "text": "Sure — **hello** from \`pi-web\`.",
+    "text": "Sure — **hello** from \`omp-mobile\`.",
     "thinking": "i should read the readme now",
     "type": "assistant",
   },

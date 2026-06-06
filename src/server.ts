@@ -39,6 +39,14 @@ interface ServerArgs {
 	tls: { certFile: string; keyFile: string } | null;
 }
 
+function firstEnv(...names: string[]): string | null {
+	for (const name of names) {
+		const value = process.env[name]?.trim();
+		if (value) return value;
+	}
+	return null;
+}
+
 function stripBrackets(host: string): string {
 	const trimmed = host.trim();
 	if (trimmed.startsWith("[") && trimmed.endsWith("]")) return trimmed.slice(1, -1);
@@ -78,9 +86,9 @@ function isAnyAddressHost(host: string): boolean {
 
 function parseArgs(argv: string[]): ServerArgs {
 	const args = argv.slice(2);
-	let host = process.env.PI_WEB_HOST?.trim() || "localhost";
-	let port = Number.parseInt(process.env.PI_WEB_PORT?.trim() || "4317", 10);
-	let token = process.env.PI_WEB_TOKEN?.trim() || null;
+	let host = firstEnv("OMP_MOBILE_HOST", "PI_WEB_HOST") || "localhost";
+	let port = Number.parseInt(firstEnv("OMP_MOBILE_PORT", "PI_WEB_PORT") || "4317", 10);
+	let token = firstEnv("OMP_MOBILE_TOKEN", "PI_WEB_TOKEN");
 
 	for (let i = 0; i < args.length; i += 1) {
 		const arg = args[i];
@@ -91,16 +99,19 @@ function parseArgs(argv: string[]): ServerArgs {
 		} else if (arg === "--token" && i + 1 < args.length) {
 			token = args[++i] ?? null;
 		} else if (arg === "--help" || arg === "-h") {
-			console.log(`pi-web
+			console.log(`omp-mobile
 
 Usage:
   bun run dev [--host <host>] [--port <port>] [--token <token>]
 
 Env:
-  PI_WEB_HOST
-  PI_WEB_PORT
-  PI_WEB_TOKEN
-  PI_WEB_PUSH_SUBJECT
+  OMP_MOBILE_HOST
+  OMP_MOBILE_PORT
+  OMP_MOBILE_TOKEN
+  OMP_MOBILE_PUSH_SUBJECT
+  OMP_MOBILE_REPLAY
+
+Legacy PI_WEB_* names are still accepted as fallbacks.
 `);
 			process.exit(0);
 		}
@@ -166,7 +177,7 @@ function getTlsSubjectHost(certFile: string | null | undefined): string | null {
 }
 
 function resolvePreferredPushSubject(host: string, tls: ServerArgs["tls"]): string | null {
-	const explicit = process.env.PI_WEB_PUSH_SUBJECT?.trim();
+	const explicit = firstEnv("OMP_MOBILE_PUSH_SUBJECT", "PI_WEB_PUSH_SUBJECT");
 	if (explicit) return explicit;
 
 	const certHost = getTlsSubjectHost(tls?.certFile);
@@ -280,7 +291,7 @@ const pushService = new PushService();
 await pushService.init(resolvePreferredPushSubject(host, tls));
 const runtime = new PiWebRuntime({
 	onMessageNotification: async (payload) => {
-		const title = `pi${payload.sessionName ? ` · ${payload.sessionName}` : ""}`;
+		const title = `omp-mobile${payload.sessionName ? ` · ${payload.sessionName}` : ""}`;
 		const body = payload.messageText.length > 140 ? `${payload.messageText.slice(0, 137)}…` : payload.messageText;
 		const result = await pushService.send({
 			title,
@@ -297,10 +308,10 @@ const runtime = new PiWebRuntime({
 });
 const faceId = new FaceIdService();
 const requiresAuth = !isLoopbackHost(host) && !isTailnetHost(host);
-const replayEnabled = process.env.PI_WEB_REPLAY?.trim() === "1";
+const replayEnabled = firstEnv("OMP_MOBILE_REPLAY", "PI_WEB_REPLAY") === "1";
 
 if (requiresAuth && !token) {
-	throw new Error(`Missing token. Provide --token <token> or set PI_WEB_TOKEN when binding to non-loopback host (${host}).`);
+	throw new Error(`Missing token. Provide --token <token> or set OMP_MOBILE_TOKEN when binding to non-loopback host (${host}).`);
 }
 
 const publicDir = join(import.meta.dir, "..", "public");
@@ -1353,7 +1364,7 @@ Bun.serve({
 
 const scheme = tls ? "https" : "http";
 const baseUrl = `${scheme}://${host}:${port}`;
-console.log(`pi-web listening on ${baseUrl}`);
+console.log(`omp-mobile listening on ${baseUrl}`);
 if (tls) {
 	console.log("TLS enabled with Tailscale certs.");
 }

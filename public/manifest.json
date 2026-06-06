@@ -1,7 +1,7 @@
 {
-  "name": "pi-mobile",
-  "short_name": "pi",
-  "description": "Web UI for pi coding sessions",
+  "name": "omp-mobile",
+  "short_name": "OMP",
+  "description": "Web UI for OMP coding sessions",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

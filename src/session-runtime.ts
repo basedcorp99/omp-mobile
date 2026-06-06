@@ -902,7 +902,7 @@ function safeStatsSnapshot(session: AgentSession): ApiSessionState["stats"] {
 	}
 }
 
-// Only include built-in commands that actually work as plain slash commands in pi-mobile.
+// Only include built-in commands that actually work as plain slash commands in omp-mobile.
 // Commands with dedicated mobile UI (for example tree/fork launchers) are surfaced elsewhere
 // instead of being sent through the prompt pipeline.
 const BUILTIN_COMMANDS: ApiSessionCommand[] = [
@@ -1356,12 +1356,18 @@ export class PiWebRuntime {
 	constructor(options: PiWebRuntimeOptions = {}) {
 		this.onMessageNotification = options.onMessageNotification;
 		try {
-			if (existsSync(this.archiveStorePath)) {
-				const raw = readFileSync(this.archiveStorePath, "utf8");
+			const archivePath = existsSync(this.archiveStorePath)
+				? this.archiveStorePath
+				: existsSync(this.legacyArchiveStorePath)
+					? this.legacyArchiveStorePath
+					: null;
+			if (archivePath) {
+				const raw = readFileSync(archivePath, "utf8");
 				const parsed = JSON.parse(raw);
 				if (Array.isArray(parsed)) {
 					this.archivedSessionIds = new Set(parsed.filter((id) => typeof id === "string"));
 				}
+				if (archivePath !== this.archiveStorePath) void this.saveArchiveToDisk();
 			}
 		} catch (err) {
 			console.error("Failed to load archive list:", err);
@@ -1671,9 +1677,11 @@ export class PiWebRuntime {
 	private async getModelRegistry(): Promise<any> {
 		return this.modelRegistryPromise;
 	}
-	private archiveStorePath = join(homedir(), ".pi", "agent", "pi-web", "archive.json");
+	private archiveStorePath = join(homedir(), ".omp", "agent", "omp-mobile", "archive.json");
+	private legacyArchiveStorePath = join(homedir(), ".pi", "agent", "pi-web", "archive.json");
 	private archivedSessionIds = new Set<string>();
-	private repoStorePath = join(homedir(), ".pi", "agent", "pi-web", "repos.json");
+	private repoStorePath = join(homedir(), ".omp", "agent", "omp-mobile", "repos.json");
+	private legacyRepoStorePath = join(homedir(), ".pi", "agent", "pi-web", "repos.json");
 
 	private async saveArchiveToDisk(): Promise<void> {
 		try {
@@ -1695,14 +1703,20 @@ export class PiWebRuntime {
 	}
 
 	private async loadReposFromDisk(): Promise<string[]> {
-		try {
-			const raw = await readFile(this.repoStorePath, "utf8");
-			const parsed = JSON.parse(raw);
-			if (!Array.isArray(parsed)) return [];
-			return parsed.filter((p) => typeof p === "string").map((p) => p.trim()).filter(Boolean);
-		} catch {
-			return [];
+		const paths = [this.repoStorePath, this.legacyRepoStorePath];
+		for (const path of paths) {
+			try {
+				const raw = await readFile(path, "utf8");
+				const parsed = JSON.parse(raw);
+				if (!Array.isArray(parsed)) continue;
+				const repos = parsed.filter((p) => typeof p === "string").map((p) => p.trim()).filter(Boolean);
+				if (path !== this.repoStorePath) await this.saveReposToDisk(repos);
+				return repos;
+			} catch {
+				// try next path
+			}
 		}
+		return [];
 	}
 
 	private async saveReposToDisk(repos: string[]): Promise<void> {

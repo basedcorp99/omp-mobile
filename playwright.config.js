@@ -1,7 +1,7 @@
 // @ts-check
 import { defineConfig, devices } from "@playwright/test";
 
-const PORT = Number.parseInt(process.env.PI_WEB_E2E_PORT || "4318", 10);
+const PORT = Number.parseInt(process.env.OMP_MOBILE_E2E_PORT || process.env.PI_WEB_E2E_PORT || "4318", 10);
 
 export default defineConfig({
 	testDir: "tests/e2e",
@@ -15,7 +15,7 @@ export default defineConfig({
 		},
 	},
 	webServer: {
-		command: `PI_WEB_HOST=127.0.0.1 PI_WEB_PORT=${PORT} PI_WEB_REPLAY=1 bun src/server.ts`,
+		command: `OMP_MOBILE_HOST=127.0.0.1 OMP_MOBILE_PORT=${PORT} OMP_MOBILE_REPLAY=1 bun src/server.ts`,
 		url: `http://127.0.0.1:${PORT}/health`,
 		reuseExistingServer: true,
 		timeout: 120_000,

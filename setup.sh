@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# pi-mobile setup
-# Installs: pi-mobile launcher to ~/.bin, systemd service, optional voice model (Parakeet)
+# omp-mobile setup
+# Installs: omp-mobile launcher to ~/.bin, systemd service, optional voice model (Parakeet)
 # Usage: ./setup.sh          (interactive)
 #        ./setup.sh --all    (install everything including voice)
 #        ./setup.sh --no-voice  (skip voice setup)
 #
 # Optional env overrides for systemd install:
-#   PI_MOBILE_HOST=127.0.0.1|100.x.x.x|0.0.0.0
-#   PI_MOBILE_PORT=4317
+#   OMP_MOBILE_HOST=127.0.0.1|100.x.x.x
+#   OMP_MOBILE_PORT=4317
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BIN_DIR="$HOME/.bin"
@@ -134,7 +134,7 @@ require_npm() {
     return 0
   fi
 
-  err "npm is required because pi-mobile can load OMP from the global npm install"
+  err "npm is required because omp-mobile loads OMP from the global npm install"
   err "Install Node.js/npm, then rerun ./setup.sh"
   exit 1
 }
@@ -153,7 +153,7 @@ ensure_global_npm_package() {
     else
       ok "$pkg found globally: $pkg_dir"
       if [[ -n "$cmd" ]]; then
-        warn "$cmd is not currently in PATH — pi-mobile will still use the global package directly"
+        warn "$cmd is not currently in PATH — omp-mobile will still use the global package directly"
       fi
     fi
     return 0
@@ -198,15 +198,15 @@ ok "Dependencies installed"
 # ── 4. Create ~/.bin ──────────────────────────────────────────────
 mkdir -p "$BIN_DIR"
 
-# ── 6. Create pi-mobile launcher ─────────────────────────────────
-cat > "$BIN_DIR/pi-mobile" << 'LAUNCHER'
+# ── 6. Create omp-mobile launcher ────────────────────────────────
+cat > "$BIN_DIR/omp-mobile" << 'LAUNCHER'
 #!/usr/bin/env bash
 set -euo pipefail
 
-PIMOBILE_DIR="${PIMOBILE_DIR:-__SCRIPT_DIR__}"
+OMP_MOBILE_DIR="${OMP_MOBILE_DIR:-${PIMOBILE_DIR:-__SCRIPT_DIR__}}"
 
 usage() {
-  echo "Usage: pi-mobile [options]"
+  echo "Usage: omp-mobile [options]"
   echo ""
   echo "Options:"
   echo "  --host <ip>      Bind address (default: 127.0.0.1)"
@@ -215,9 +215,9 @@ usage() {
   echo "  --help           Show this help"
   echo ""
   echo "Examples:"
-  echo "  pi-mobile                              # localhost:4317"
-  echo "  pi-mobile --host 0.0.0.0 --port 8080   # public"
-  echo "  pi-mobile --host \$(tailscale ip -4)     # tailscale"
+  echo "  omp-mobile                              # localhost:4317"
+  echo "  omp-mobile --host 127.0.0.1 --port 8080 # local alternate port"
+  echo "  omp-mobile --host \$(tailscale ip -4)     # tailscale"
 }
 
 if [[ "${1:-}" == "--help" ]]; then
@@ -225,15 +225,15 @@ if [[ "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
-cd "$PIMOBILE_DIR"
+cd "$OMP_MOBILE_DIR"
 exec __BUN_BIN__ src/server.ts "$@"
 LAUNCHER
 
 # Patch in the actual directory
-sed -i "s|__SCRIPT_DIR__|$SCRIPT_DIR|g" "$BIN_DIR/pi-mobile"
-sed -i "s|__BUN_BIN__|$BUN_BIN|g" "$BIN_DIR/pi-mobile"
-chmod +x "$BIN_DIR/pi-mobile"
-ok "Installed pi-mobile launcher → $BIN_DIR/pi-mobile"
+sed -i "s|__SCRIPT_DIR__|$SCRIPT_DIR|g" "$BIN_DIR/omp-mobile"
+sed -i "s|__BUN_BIN__|$BUN_BIN|g" "$BIN_DIR/omp-mobile"
+chmod +x "$BIN_DIR/omp-mobile"
+ok "Installed omp-mobile launcher → $BIN_DIR/omp-mobile"
 
 # ── 7. Install systemd service ────────────────────────────────────
 install_systemd_service() {
@@ -242,13 +242,13 @@ install_systemd_service() {
     return 0
   fi
 
-  local service_template="$SCRIPT_DIR/systemd/pi-mobile.service"
+  local service_template="$SCRIPT_DIR/systemd/omp-mobile.service"
   if [[ ! -f "$service_template" ]]; then
     warn "Service template not found at $service_template"
     return 1
   fi
 
-  local host="${PI_MOBILE_HOST:-}"
+  local host="${OMP_MOBILE_HOST:-${PI_MOBILE_HOST:-}}"
   if [[ -z "$host" ]] && command -v tailscale &>/dev/null; then
     host="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
   fi
@@ -256,7 +256,7 @@ install_systemd_service() {
     host="127.0.0.1"
   fi
 
-  local port="${PI_MOBILE_PORT:-4317}"
+  local port="${OMP_MOBILE_PORT:-${PI_MOBILE_PORT:-4317}}"
   local bun_bin="$BUN_BIN"
   if [[ -z "$bun_bin" ]]; then
     warn "bun not found — skipping systemd service install"
@@ -274,20 +274,20 @@ install_systemd_service() {
     -e "s|__PORT__|$port|g" \
     "$service_template" > "$tmp_service"
 
-  if ! run_privileged install -D -m 0644 "$tmp_service" /etc/systemd/system/pi-mobile.service; then
+  if ! run_privileged install -D -m 0644 "$tmp_service" /etc/systemd/system/omp-mobile.service; then
     rm -f "$tmp_service"
-    warn "Need sudo/root to install /etc/systemd/system/pi-mobile.service"
+    warn "Need sudo/root to install /etc/systemd/system/omp-mobile.service"
     return 1
   fi
   rm -f "$tmp_service"
 
   run_privileged systemctl daemon-reload
-  run_privileged systemctl enable --now pi-mobile.service
-  ok "Installed systemd service → /etc/systemd/system/pi-mobile.service"
+  run_privileged systemctl enable --now omp-mobile.service
+  ok "Installed systemd service → /etc/systemd/system/omp-mobile.service"
   ok "Service enabled + started (host=$host port=$port)"
 }
 
-install_systemd_service || warn "Systemd service install failed — you can still run pi-mobile manually"
+install_systemd_service || warn "Systemd service install failed — you can still run omp-mobile manually"
 
 # ── 8. Add ~/.bin to PATH + shell hooks if needed ─────────────────
 ensure_shell_line() {
@@ -302,7 +302,7 @@ ensure_shell_line() {
 
   if [[ -f "$shell_rc" ]] || [[ "$shell_rc" == "$HOME/.bashrc" ]] || [[ "$shell_rc" == "$HOME/.zshrc" ]] || [[ "$shell_rc" == "$HOME/.profile" ]]; then
     echo "" >> "$shell_rc"
-    echo "# pi-mobile" >> "$shell_rc"
+    echo "# omp-mobile" >> "$shell_rc"
     echo "$line" >> "$shell_rc"
     ok "Added $description to $(basename "$shell_rc")"
   fi
@@ -390,7 +390,7 @@ install_voice() {
 }
 
 if [[ "$VOICE_FLAG" == "yes" ]]; then
-  install_voice || warn "Voice setup failed — pi-mobile will work without it"
+  install_voice || warn "Voice setup failed — omp-mobile will work without it"
 elif [[ "$VOICE_FLAG" == "no" ]]; then
   info "Skipping voice setup (--no-voice)"
 else
@@ -398,7 +398,7 @@ else
   printf '\033[1m?\033[0m Install voice transcription (Parakeet, ~640MB download)? [y/N] '
   read -r answer
   if [[ "$answer" =~ ^[Yy] ]]; then
-    install_voice || warn "Voice setup failed — pi-mobile will work without it"
+    install_voice || warn "Voice setup failed — omp-mobile will work without it"
   else
     info "Skipping voice — you can run ./setup.sh --all later"
   fi
@@ -409,10 +409,10 @@ echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 ok "Setup complete!"
 echo ""
-echo "  Run:      pi-mobile"
-echo "  Service:  sudo systemctl restart pi-mobile"
-echo "  Logs:     journalctl -u pi-mobile -f"
-echo "  Override: PI_MOBILE_HOST=127.0.0.1 PI_MOBILE_PORT=4317 ./setup.sh"
+echo "  Run:      omp-mobile"
+echo "  Service:  sudo systemctl restart omp-mobile"
+echo "  Logs:     journalctl -u omp-mobile -f"
+echo "  Override: OMP_MOBILE_HOST=127.0.0.1 OMP_MOBILE_PORT=4317 ./setup.sh"
 echo ""
 if [[ ! -d "$PARAKEET_MODEL_DIR" ]] || [[ ! -f "$PARAKEET_MODEL_DIR/nemo128.onnx" ]]; then
   echo "  Voice: not installed (run ./setup.sh --all to add)"

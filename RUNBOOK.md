@@ -1,44 +1,41 @@
 # Runbook
 
-## Setup and extension notes
+## Setup Notes
 
 `./setup.sh` installs three separate things:
 
-- the `pi-mobile` launcher in `~/.bin/pi-mobile`
-- the `pi-mobile` systemd unit in `/etc/systemd/system/pi-mobile.service`
-- the custom `/review` Pi extension in `~/.pi/agent/extensions/review.ts`
+- the `omp-mobile` launcher in `~/.bin/omp-mobile`
+- the `omp-mobile` systemd unit in `/etc/systemd/system/omp-mobile.service`
 
-The `/review` extension source lives in this repo at `pi-extension/review.ts`, but it is meant to be copied into Pi's normal extension directory.
-Do **not** add the `pi-mobile` repo URL to Pi's `packages` list just to get `/review` loaded; that makes Pi try to load the extension straight from the cloned repo path.
-
-If you change `pi-extension/review.ts`, rerun `./setup.sh` to reinstall the copied extension.
+It also installs the global OMP package (`@oh-my-pi/pi-coding-agent`) when missing and installs web app dependencies with Bun.
+Slash commands, including `/review` when OMP exposes it, come from OMP/ACP command discovery. There are no legacy Pi plugin packages to install or copy from this repo.
 
 ## systemd service
 
-The repo-owned unit file lives at [`systemd/pi-mobile.service`](./systemd/pi-mobile.service).
-`./setup.sh` templates it with your current user, Bun path, repo path, host, and port, then installs it to `/etc/systemd/system/pi-mobile.service`.
+The repo-owned unit file lives at [`systemd/omp-mobile.service`](./systemd/omp-mobile.service).
+`./setup.sh` templates it with your current user, Bun path, repo path, host, and port, then installs it to `/etc/systemd/system/omp-mobile.service`.
 
 Host selection during setup:
-- `PI_MOBILE_HOST` if set
+- `OMP_MOBILE_HOST` if set
 - otherwise `tailscale ip -4` if available
 - otherwise `127.0.0.1`
 
 Port selection during setup:
-- `PI_MOBILE_PORT` if set
+- `OMP_MOBILE_PORT` if set
 - otherwise `4317`
 
 Common commands:
 
 ```bash
-sudo systemctl status pi-mobile
-sudo systemctl restart pi-mobile
-journalctl -u pi-mobile -f
+sudo systemctl status omp-mobile
+sudo systemctl restart omp-mobile
+journalctl -u omp-mobile -f
 ```
 
 Reinstall the unit with different bind settings:
 
 ```bash
-PI_MOBILE_HOST=127.0.0.1 PI_MOBILE_PORT=4317 ./setup.sh
+OMP_MOBILE_HOST=127.0.0.1 OMP_MOBILE_PORT=4317 ./setup.sh
 ```
 
 ---
@@ -59,8 +56,8 @@ Open `http://localhost:4317`. No token needed on loopback.
 Bind to your Tailscale IP (the `100.x.x.x` address from `tailscale ip -4`):
 
 ```bash
-PI_MOBILE_HOST=$(tailscale ip -4 | head -n1) ./setup.sh
-sudo systemctl restart pi-mobile
+OMP_MOBILE_HOST=$(tailscale ip -4 | head -n1) ./setup.sh
+sudo systemctl restart omp-mobile
 ```
 
 Or run manually:
@@ -124,7 +121,7 @@ Pass it via query string (`?token=MY_SECRET`) or `Authorization: Bearer MY_SECRE
 You can also set it via environment variable:
 
 ```bash
-PI_WEB_TOKEN=MY_SECRET bun run dev -- --host 192.168.1.50 --port 4317
+OMP_MOBILE_TOKEN=MY_SECRET bun run dev -- --host 192.168.1.50 --port 4317
 ```
 
 ---
@@ -133,7 +130,7 @@ PI_WEB_TOKEN=MY_SECRET bun run dev -- --host 192.168.1.50 --port 4317
 
 Face ID / Touch ID is optional. It is off by default and can be enabled by adding `?faceid=1` to the URL (the setting is remembered in localStorage).
 
-When enabled, the server can require biometric enrollment and stores credentials in `~/.pi/agent/pi-web/faceid-credentials.json`.
+When enabled, the server can require biometric enrollment and stores credentials in `~/.omp/agent/omp-mobile/faceid-credentials.json`.
 
 Note: WebAuthn generally requires a hostname like `localhost` or a real domain; raw IPs (including Tailscale `100.x` addresses) may fail. Prefer MagicDNS hostnames like `https://your-machine.ts.net:4317`.
 
@@ -155,7 +152,7 @@ On iPhone, it opens the photo picker; on desktop, you can also paste screenshots
 
 ## Voice transcription (Parakeet)
 
-`pi-mobile` expects a local Parakeet transcriber at:
+`omp-mobile` expects a local Parakeet transcriber at:
 
 - `/usr/local/bin/parakeet-transcribe`
 - model dir `/usr/local/share/parakeet-tdt-0.6b-v3-int8`
@@ -210,7 +207,7 @@ bun run test:e2e -- --update-snapshots
 E2E tests use deterministic replay from `public/fixtures/*.json`. Enable fixture serving:
 
 ```bash
-PI_WEB_REPLAY=1 bun run dev
+OMP_MOBILE_REPLAY=1 bun run dev
 ```
 
 Then open e.g. `http://localhost:4317/?replay=basic`.
