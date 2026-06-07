@@ -75,14 +75,14 @@ const {
 // Worktree isolation guardrails
 // ---------------------------------------------------------------------------
 
-const WORKTREE_CWD_RE = /\/\.worktrees\/worktree-([^/]+)$/;
+const WORKTREE_CWD_RE = /\/\.worktrees\/worktree-([^/]+)(?:\/merged)?$/;
 
 function parseWorktreeInfo(cwd: string): { name: string; branch: string; repoRoot: string } | null {
 	const match = cwd.match(WORKTREE_CWD_RE);
 	if (!match) return null;
 	const name = match[1];
 	const branch = `worktree-${name}`;
-	const repoRoot = cwd.replace(/\/\.worktrees\/worktree-[^/]+$/, "");
+	const repoRoot = cwd.replace(/\/\.worktrees\/worktree-[^/]+(?:\/merged)?$/, "");
 	return { name, branch, repoRoot };
 }
 
@@ -2438,6 +2438,16 @@ export class PiWebRuntime {
 		});
 	}
 
+	private async exec(cmd: string, args: string[], cwd: string = "."): Promise<{ stdout: string; exitCode: number }> {
+		const { execFile } = await import("node:child_process");
+		return new Promise((resolve) => {
+			execFile(cmd, args, { cwd, timeout: 15_000 }, (err, stdout) => {
+				const code = err && typeof (err as any).code === "number" ? (err as any).code : (err ? 1 : 0);
+				resolve({ stdout: (stdout || "").trim(), exitCode: code });
+			});
+		});
+	}
+
 	private async getRepoRoot(cwd: string): Promise<string | null> {
 		const { stdout: toplevel, exitCode } = await this.gitExec(cwd, ["rev-parse", "--show-toplevel"]);
 		if (exitCode !== 0 || !toplevel) return null;
@@ -2481,8 +2491,12 @@ export class PiWebRuntime {
 
 			for (const entry of entries) {
 				if (!entry.startsWith("worktree-")) continue;
-				const wtPath = join(wtDir, entry);
-				if (!existsSync(join(wtPath, ".git"))) continue;
+				let wtPath = join(wtDir, entry);
+				if (existsSync(join(wtPath, "merged", ".git"))) {
+					wtPath = join(wtPath, "merged");
+				} else if (!existsSync(join(wtPath, ".git"))) {
+					continue;
+				}
 
 				const name = entry.replace(/^worktree-/, "");
 				const { stdout: statusOut } = await this.gitExec(wtPath, ["status", "--porcelain"]);
@@ -2512,29 +2526,99 @@ export class PiWebRuntime {
 
 		const branch = `worktree-${name}`;
 		const wtDir = join(repoRoot, ".worktrees");
-		const wtPath = join(wtDir, branch);
+		const wtBaseDir = join(wtDir, branch);
+		const wtMergedPath = join(wtBaseDir, "merged");
+		const wtUpperPath = join(wtBaseDir, "upper");
+		const wtWorkPath = join(wtBaseDir, "work");
 
-		if (existsSync(wtPath)) throw new Error("worktree_already_exists");
+		if (existsSync(wtBaseDir)) throw new Error("worktree_already_exists");
 
-		const { mkdirSync } = await import("node:fs");
-		mkdirSync(wtDir, { recursive: true });
+		const { mkdirSync, writeFileSync, readFileSync, rmSync } = await import("node:fs");
+		mkdirSync(wtBaseDir, { recursive: true });
 
-		const base = request.baseBranch?.trim() || "HEAD";
-		const { stdout: branchCheck } = await this.gitExec(repoRoot, ["show-ref", "--verify", `refs/heads/${branch}`]);
-		if (!branchCheck) {
-			const { exitCode } = await this.gitExec(repoRoot, ["branch", branch, base]);
-			if (exitCode !== 0) throw new Error("failed_to_create_branch");
+		let overlayMounted = false;
+		let worktreePath = wtMergedPath;
+
+		try {
+			mkdirSync(wtMergedPath, { recursive: true });
+			mkdirSync(wtUpperPath, { recursive: true });
+			mkdirSync(wtWorkPath, { recursive: true });
+
+			const base = request.baseBranch?.trim() || "HEAD";
+			const { stdout: branchCheck } = await this.gitExec(repoRoot, ["show-ref", "--verify", `refs/heads/${branch}`]);
+			if (!branchCheck) {
+				const { exitCode } = await this.gitExec(repoRoot, ["branch", branch, base]);
+				if (exitCode !== 0) throw new Error("failed_to_create_branch");
+			}
+
+			// Add worktree with no checkout
+			const { exitCode: wtResult } = await this.gitExec(repoRoot, ["worktree", "add", "--no-checkout", wtMergedPath, branch]);
+			if (wtResult !== 0) {
+				await this.gitExec(repoRoot, ["worktree", "prune"]);
+				const { exitCode: retry } = await this.gitExec(repoRoot, ["worktree", "add", "--no-checkout", wtMergedPath, branch]);
+				if (retry !== 0) throw new Error("failed_to_add_worktree_no_checkout");
+			}
+
+			// Backup .git file
+			const gitFileContent = readFileSync(join(wtMergedPath, ".git"), "utf8");
+			rmSync(join(wtMergedPath, ".git"));
+
+			// Mount overlayfs
+			const mountResult = await this.exec("mount", [
+				"-t", "overlay", "overlay",
+				"-o", `lowerdir=${repoRoot},upperdir=${wtUpperPath},workdir=${wtWorkPath}`,
+				wtMergedPath
+			], repoRoot);
+
+			if (mountResult.exitCode !== 0) {
+				throw new Error(`mount failed: ${mountResult.stdout}`);
+			}
+
+			overlayMounted = true;
+
+			// Remove lower .git if showing up, write .git file back
+			try {
+				rmSync(join(wtMergedPath, ".git"), { recursive: true, force: true });
+			} catch (e) {}
+			writeFileSync(join(wtMergedPath, ".git"), gitFileContent);
+
+			// Refresh index
+			const { exitCode: resetResult = 1 } = await this.gitExec(wtMergedPath, ["reset", "--hard", "HEAD"]);
+			if (resetResult !== 0) throw new Error("failed_to_reset_worktree");
+
+		} catch (error) {
+			// Cleanup overlayfs if mounted
+			if (overlayMounted) {
+				try { await this.exec("umount", [wtMergedPath], repoRoot); } catch (e) {}
+			}
+			try {
+				await this.gitExec(repoRoot, ["worktree", "remove", wtMergedPath, "--force"]);
+			} catch (e) {}
+			try {
+				rmSync(wtBaseDir, { recursive: true, force: true });
+			} catch (e) {}
+
+			// Fallback path: standard worktree checkout directly at wtMergedPath (inside wtBaseDir/merged)
+			mkdirSync(wtBaseDir, { recursive: true });
+			mkdirSync(wtMergedPath, { recursive: true });
+
+			const base = request.baseBranch?.trim() || "HEAD";
+			const { stdout: branchCheck } = await this.gitExec(repoRoot, ["show-ref", "--verify", `refs/heads/${branch}`]);
+			if (!branchCheck) {
+				const { exitCode } = await this.gitExec(repoRoot, ["branch", branch, base]);
+				if (exitCode !== 0) throw new Error("failed_to_create_branch");
+			}
+
+			const { exitCode: wtResult } = await this.gitExec(repoRoot, ["worktree", "add", wtMergedPath, branch]);
+			if (wtResult !== 0 && !existsSync(join(wtMergedPath, ".git"))) {
+				await this.gitExec(repoRoot, ["worktree", "prune"]);
+				const { exitCode: retry } = await this.gitExec(repoRoot, ["worktree", "add", wtMergedPath, branch]);
+				if (retry !== 0 && !existsSync(join(wtMergedPath, ".git"))) throw new Error("failed_to_create_worktree");
+			}
 		}
 
-		const { exitCode: wtResult } = await this.gitExec(repoRoot, ["worktree", "add", wtPath, branch]);
-		if (wtResult !== 0 && !existsSync(join(wtPath, ".git"))) {
-			await this.gitExec(repoRoot, ["worktree", "prune"]);
-			const { exitCode: retry } = await this.gitExec(repoRoot, ["worktree", "add", wtPath, branch]);
-			if (retry !== 0 && !existsSync(join(wtPath, ".git"))) throw new Error("failed_to_create_worktree");
-		}
-
-		const result = await this.startSession({ clientId: request.clientId, cwd: wtPath, startAgent: request.startAgent });
-		return { sessionId: result.sessionId, worktreePath: wtPath };
+		const result = await this.startSession({ clientId: request.clientId, cwd: worktreePath, startAgent: request.startAgent });
+		return { sessionId: result.sessionId, worktreePath };
 	}
 
 	async mergeWorktree(request: { worktreePath: string; targetBranch?: string }): Promise<{ merged: boolean; message: string }> {
@@ -2570,9 +2654,22 @@ export class PiWebRuntime {
 			if (runtime.cwd === wtPath) { await this.stopSession(sessionId); break; }
 		}
 
+		try {
+			await this.exec("umount", ["-l", wtPath], repoRoot);
+		} catch (e) {}
+
 		const { stdout: wtBranch } = await this.gitExec(wtPath, ["symbolic-ref", "--short", "HEAD"]);
 		await this.gitExec(repoRoot, ["worktree", "remove", wtPath, "--force"]);
 		if (wtBranch) await this.gitExec(repoRoot, ["branch", "-D", wtBranch]);
+
+		// Clean up the parent directory if it's our structured directory
+		const parentDir = dirname(wtPath);
+		if (basename(parentDir).startsWith("worktree-")) {
+			const { rmSync } = await import("node:fs");
+			try {
+				rmSync(parentDir, { recursive: true, force: true });
+			} catch (e) {}
+		}
 	}
 
 	async autoCleanupWorktree(wtPath: string): Promise<boolean> {
@@ -2589,7 +2686,6 @@ export class PiWebRuntime {
 		await this.deleteWorktree(wtPath);
 		return true;
 	}
-
 	async getWorktreeBranches(repoPath: string): Promise<string[]> {
 		const repoRoot = await this.getRepoRoot(repoPath);
 		if (!repoRoot) return [];

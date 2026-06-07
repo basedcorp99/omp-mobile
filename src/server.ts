@@ -461,7 +461,12 @@ function scoreDirectoryMatch(path: string, query: string): number {
 	else if (depth <= 3) score += 80;
 	if (lowerPath.includes("/.worktrees/worktree-")) {
 		const wtDepth = lowerPath.split("/.worktrees/worktree-")[1];
-		if (wtDepth && !wtDepth.includes("/")) score += 150;
+		if (wtDepth) {
+			const subParts = wtDepth.split("/").filter(Boolean);
+			if (subParts.length === 1 || (subParts.length === 2 && subParts[1] === "merged")) {
+				score += 150;
+			}
+		}
 	}
 	if (lowerPath.startsWith("/root/")) score += 10;
 	return score;

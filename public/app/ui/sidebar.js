@@ -235,7 +235,7 @@ export function createSidebar({
 	}
 
 	function extractWorktreeName(cwd) {
-		const match = String(cwd || "").match(/\/\.worktrees\/worktree-(.+)$/);
+		const match = String(cwd || "").match(/\/\.worktrees\/worktree-([^/]+)(?:\/merged)?$/);
 		return match ? match[1] : null;
 	}
 
